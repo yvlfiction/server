@@ -2,7 +2,19 @@ import asyncio
 import json
 import os
 import platform
-import websockets
+import websocketscd ~/command-server
+python3 - <<'PY'
+import json, hashlib, getpass
+
+token = getpass.getpass("Paste your original client token: ")
+with open("keys.json") as f:
+    keys = json.load(f)
+
+expected = keys.get("client1")
+actual = hashlib.sha256(token.encode()).hexdigest()
+
+print("MATCH — token is correct" if expected == actual else "NO MATCH — token is incorrect")
+PY
 
 SERVER_URL = "ws://127.0.0.1:8000/ws"
 
