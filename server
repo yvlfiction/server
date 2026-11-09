@@ -1,12 +1,25 @@
-cd ~/command-server
-python3 - <<'PY'
-import json, hashlib, getpass
+import asyncio
+import json
+import websockets
 
-token = getpass.getpass("Paste your original token: ")
+TOKEN = "your_token_here"  # the original token you hashed to get that key
 
-with open("keys.json") as f:
-    keys = json.load(f)
+async def main():
+    async with websockets.connect("ws://127.0.0.1:8000/ws") as ws:
+        # Authenticate
+        await ws.send(json.dumps({"client_id": "client1", "token": TOKEN}))
+        resp = json.loads(await ws.receive())
+        if not resp.get("ok"):
+            print("Auth failed")
+            return
+        print("Connected.")
 
-actual = hashlib.sha256(token.encode()).hexdigest()
-print("MATCH" if keys.get("client1") == actual else "NO MATCH")
-PY
+        # Listen for commands
+        while True:
+            msg = json.loads(await ws.receive())
+            if msg.get("command") == "ping":
+                await ws.send(json.dumps({"result": "pong"}))
+            elif msg.get("command") == "get_version":
+                await ws.send(json.dumps({"result": "1.0"}))
+
+asyncio.run(main())   
