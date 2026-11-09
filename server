@@ -1,64 +1,12 @@
-import asyncio
-import json
-import os
-import platform
-import websocketscd ~/command-server
+cd ~/command-server
 python3 - <<'PY'
 import json, hashlib, getpass
 
-token = getpass.getpass("Paste your original client token: ")
+token = getpass.getpass("Paste your original token: ")
+
 with open("keys.json") as f:
     keys = json.load(f)
 
-expected = keys.get("client1")
 actual = hashlib.sha256(token.encode()).hexdigest()
-
-print("MATCH — token is correct" if expected == actual else "NO MATCH — token is incorrect")
+print("MATCH" if keys.get("client1") == actual else "NO MATCH")
 PY
-
-SERVER_URL = "ws://127.0.0.1:8000/ws"
-
-CLIENT_ID = "client1"
-CLIENT_TOKEN = "PASTE_YOUR_TOKEN_HERE"
-
-
-async def main():
-    while True:
-        try:
-            print("Connecting to server...")
-
-            async with websockets.connect(SERVER_URL) as ws:
-                await ws.send(json.dumps({
-                    "client_id": CLIENT_ID,
-                    "token": CLIENT_TOKEN
-                }))
-
-                response = json.loads(await ws.recv())
-
-                if not response.get("ok"):
-                    print("Authentication failed.")
-                    return
-
-                print("Connected and authenticated!")
-
-                async for message in ws:
-                    command = json.loads(message)
-
-                    if command.get("action") == "ping":
-                        await ws.send(json.dumps({
-                            "response": "pong"
-                        }))
-
-                    elif command.get("action") == "get_version":
-                        await ws.send(json.dumps({
-                            "version": platform.python_version()
-                        }))
-
-        except Exception as e:
-            print("Connection error:", e)
-            print("Retrying in 5 seconds...")
-            await asyncio.sleep(5)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
