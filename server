@@ -1,0 +1,89 @@
+import asyncio
+import json
+import hashlib
+from pathlib import Path
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import uvicorn
+
+app = FastAPI()
+KEYS_FILE = Path("keys.json")
+clients = {}
+
+def load_keys():
+    if not KEYS_FILE.exists():
+        KEYS_FILE.write_text("{}")
+    return json.loads(KEYS_FILE.read_text())
+
+def hash_token(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    await ws.accept()
+    client_id = None
+
+    try:
+        auth = json.loads(await ws.receive_text())
+        client_id = auth.get("client_id")
+        token = auth.get("token", "")
+
+        if load_keys().get(client_id) != hash_token(token):
+            await ws.send_text(json.dumps({"ok": False}))
+            await ws.close()
+            return
+
+        clients[client_id] = ws
+        await ws.send_text(json.dumps({"ok": True}))
+
+        while True:
+            message = await ws.receive_text()
+            print(f"{client_id}: {message}")
+
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if client_id and clients.get(client_id) is ws:
+            del clients[client_id]
+
+async def admin():
+    print("Commands: clients | send CLIENT_ID ping | quit")
+
+    while True:
+        command = await asyncio.to_thread(input, "admin> ")
+        parts = command.split()
+
+        if not parts:
+            continue
+
+        if parts[0] == "quit":
+            break
+
+        elif parts[0] == "clients":
+            print(list(clients.keys()))
+
+        elif len(parts) == 3 and parts[0] == "send":
+            client_id, action = parts[1], parts[2]
+
+            if action not in ("ping", "get_version"):
+                print("Command not allowed.")
+            elif client_id in clients:
+                await clients[client_id].send_text(
+                    json.dumps({"command": action})
+                )
+                print("Command sent.")
+            else:
+                print("Client not connected.")
+
+async def main():
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=8000)
+    )
+
+    task = asyncio.create_task(server.serve())
+    await admin()
+    server.should_exit = True
+    await task
+
+if __name__ == "__main__":
+    asyncio.run(main())
