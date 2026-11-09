@@ -1,25 +1,198 @@
+
+from pathlib import Path
+import secrets
+import hashlib
+import json
+
+folder = Path(__file__).resolve().parent
+
+# Generate matching credentials
+client_id = "client1"
+token = secrets.token_urlsafe(32)
+token_hash = hashlib.sha256(token.encode()).hexdigest()
+
+# Remove previous generated project files
+for name in ("server.py", "client.py", "keys.json", "keygen.py"):
+    path = folder / name
+    if path.exists():
+        path.unlink()
+
+# Authentication database
+(folder / "keys.json").write_text(
+    json.dumps({client_id: token_hash}, indent=4)
+)
+
+# Server
+server_code = r'''
 import asyncio
 import json
-import websockets
+import hashlib
+from pathlib import Path
 
-TOKEN = "your_token_here"  # the original token you hashed to get that key
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import uvicorn
+
+app = FastAPI()
+KEYS_FILE = Path(__file__).with_name("keys.json")
+clients = {}
+
+def load_keys():
+    return json.loads(KEYS_FILE.read_text())
+
+def hash_token(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    await ws.accept()
+
+    try:
+        auth = json.loads(await ws.receive_text())
+        client_id = auth.get("client_id")
+        token = auth.get("token", "")
+
+        if load_keys().get(client_id) != hash_token(token):
+            await ws.send_json({"ok": False})
+            await ws.close()
+            return
+
+        clients[client_id] = ws
+        await ws.send_json({"ok": True})
+        print(f"\n[+] {client_id} connected")
+
+        while True:
+            message = await ws.receive_text()
+            print(f"[{client_id}] {message}")
+
+    except (WebSocketDisconnect, Exception):
+        pass
+
+    finally:
+        for cid, connection in list(clients.items()):
+            if connection is ws:
+                del clients[cid]
+                print(f"\n[-] {cid} disconnected")
+
+async def admin():
+    print("\nCommands: clients | send CLIENT_ID ping")
+    print("          send CLIENT_ID get_version | quit\n")
+
+    while True:
+        command = await asyncio.to_thread(input, "admin> ")
+        parts = command.split()
+
+        if not parts:
+            continue
+
+        if parts[0] == "quit":
+            return
+
+        elif parts[0] == "clients":
+            print(list(clients.keys()))
+
+        elif len(parts) == 3 and parts[0] == "send":
+            cid, action = parts[1], parts[2]
+
+            if action not in ("ping", "get_version"):
+                print("Unknown command")
+                continue
+
+            ws = clients.get(cid)
+            if ws:
+                await ws.send_json({"action": action})
+                print("Command sent")
+            else:
+                print("Client not connected")
+
+        else:
+            print("Unknown command")
 
 async def main():
-    async with websockets.connect("ws://127.0.0.1:8000/ws") as ws:
-        # Authenticate
-        await ws.send(json.dumps({"client_id": "client1", "token": TOKEN}))
-        resp = json.loads(await ws.receive())
-        if not resp.get("ok"):
-            print("Auth failed")
-            return
-        print("Connected.")
+    config = uvicorn.Config(
+        app,
+        host="127.0.0.1",
+        port=8000,
+        log_level="warning"
+    )
+    server = uvicorn.Server(config)
+    task = asyncio.create_task(server.serve())
 
-        # Listen for commands
-        while True:
-            msg = json.loads(await ws.receive())
-            if msg.get("command") == "ping":
-                await ws.send(json.dumps({"result": "pong"}))
-            elif msg.get("command") == "get_version":
-                await ws.send(json.dumps({"result": "1.0"}))
+    while not server.started:
+        if task.done():
+            await task
+        await asyncio.sleep(0.1)
 
-asyncio.run(main())   
+    await admin()
+    server.should_exit = True
+    await task
+
+if __name__ == "__main__":
+    asyncio.run(main())
+'''
+
+(folder / "server.py").write_text(server_code.strip() + "\n")
+
+# Client with automatically inserted credentials
+client_code = f'''
+import asyncio
+import json
+import platform
+import websockets
+
+SERVER_URL = "ws://127.0.0.1:8000/ws"
+CLIENT_ID = {client_id!r}
+CLIENT_TOKEN = {token!r}
+
+async def main():
+    while True:
+        try:
+            print("Connecting to server...")
+
+            async with websockets.connect(SERVER_URL) as ws:
+                await ws.send(json.dumps({{
+                    "client_id": CLIENT_ID,
+                    "token": CLIENT_TOKEN
+                }}))
+
+                response = json.loads(await ws.recv())
+
+                if not response.get("ok"):
+                    print("Authentication failed")
+                    return
+
+                print("Connected and authenticated!")
+
+                async for message in ws:
+                    command = json.loads(message)
+                    action = command.get("action")
+
+                    if action == "ping":
+                        await ws.send(json.dumps({{
+                            "response": "pong"
+                        }}))
+
+                    elif action == "get_version":
+                        await ws.send(json.dumps({{
+                            "version": platform.python_version()
+                        }}))
+
+        except Exception as error:
+            print("Connection error:", error)
+            print("Retrying in 5 seconds...")
+            await asyncio.sleep(5)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+'''
+
+(folder / "client.py").write_text(client_code.strip() + "\n")
+
+(folder / "requirements.txt").write_text(
+    "fastapi\nuvicorn\nwebsockets\n"
+)
+
+print("\nPROJECT REBUILT SUCCESSFULLY")
+print("Client ID:", client_id)
+print("New token:", token)
+print("Files created: server.py, client.py, keys.json, requirements.txt")
+print("\nKeep your token private!")
