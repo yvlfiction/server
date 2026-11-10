@@ -11,30 +11,33 @@ client_id = "client1"
 token = secrets.token_urlsafe(32)
 token_hash = hashlib.sha256(token.encode()).hexdigest()
 
-# Remove previous generated project files
-for name in ("server.py", "client.py", "keys.json", "keygen.py"):
-    path = folder / name
-    if path.exists():
-        path.unlink()
-
-# Authentication database
+# Save authentication database
 (folder / "keys.json").write_text(
     json.dumps({client_id: token_hash}, indent=4)
 )
 
-# Server
+# Server with automatic Cloudflare Tunnel
 server_code = r'''
 import asyncio
 import json
 import hashlib
+import subprocess
+import threading
+import re
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import uvicorn
 
 app = FastAPI()
-KEYS_FILE = Path(__file__).with_name("keys.json")
+BASE = Path(__file__).resolve().parent
+KEYS_FILE = BASE / "keys.json"
+URL_FILE = BASE / "server_url.txt"
+LOG_FILE = BASE / "cloudflared.log"
+
 clients = {}
+tunnel_url = None
+tunnel_process = None
 
 def load_keys():
     return json.loads(KEYS_FILE.read_text())
@@ -45,6 +48,7 @@ def hash_token(token):
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
+    client_id = None
 
     try:
         auth = json.loads(await ws.receive_text())
@@ -68,14 +72,72 @@ async def websocket_endpoint(ws: WebSocket):
         pass
 
     finally:
-        for cid, connection in list(clients.items()):
-            if connection is ws:
-                del clients[cid]
-                print(f"\n[-] {cid} disconnected")
+        if client_id and clients.get(client_id) is ws:
+            del clients[client_id]
+            print(f"\n[-] {client_id} disconnected")
+
+def start_tunnel():
+    global tunnel_process
+
+    try:
+        tunnel_process = subprocess.Popen(
+            [
+                "cloudflared", "tunnel",
+                "--no-autoupdate",
+                "--url", "http://127.0.0.1:8000"
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+
+        def read_output():
+            global tunnel_url
+
+            with open(LOG_FILE, "a") as log:
+                for line in tunnel_process.stdout:
+                    log.write(line)
+                    log.flush()
+
+                    match = re.search(
+                        r"https://[a-zA-Z0-9-]+\.trycloudflare\.com",
+                        line
+                    )
+
+                    if match and not tunnel_url:
+                        tunnel_url = match.group(0)
+                        ws_url = tunnel_url.replace(
+                            "https://", "wss://"
+                        ) + "/ws"
+
+                        URL_FILE.write_text(ws_url)
+
+                        print("\n" + "=" * 45)
+                        print("CLOUDFLARE TUNNEL READY")
+                        print("=" * 45)
+                        print("PUBLIC URL:", tunnel_url)
+                        print("CLIENT URL:", ws_url)
+                        print("Saved to server_url.txt")
+                        print("=" * 45 + "\n")
+
+        threading.Thread(
+            target=read_output,
+            daemon=True
+        ).start()
+
+    except FileNotFoundError:
+        print("\nERROR: cloudflared is not installed.")
+    except Exception as error:
+        print("\nTunnel startup error:", error)
 
 async def admin():
-    print("\nCommands: clients | send CLIENT_ID ping")
-    print("          send CLIENT_ID get_version | quit\n")
+    print("\nCommands:")
+    print("clients")
+    print("tunnel")
+    print("send CLIENT_ID ping")
+    print("send CLIENT_ID get_version")
+    print("quit\n")
 
     while True:
         command = await asyncio.to_thread(input, "admin> ")
@@ -85,10 +147,13 @@ async def admin():
             continue
 
         if parts[0] == "quit":
-            return
+            break
 
         elif parts[0] == "clients":
             print(list(clients.keys()))
+
+        elif parts[0] == "tunnel":
+            print(tunnel_url or "Tunnel URL not ready yet.")
 
         elif len(parts) == 3 and parts[0] == "send":
             cid, action = parts[1], parts[2]
@@ -98,6 +163,7 @@ async def admin():
                 continue
 
             ws = clients.get(cid)
+
             if ws:
                 await ws.send_json({"action": action})
                 print("Command sent")
@@ -114,17 +180,30 @@ async def main():
         port=8000,
         log_level="warning"
     )
+
     server = uvicorn.Server(config)
-    task = asyncio.create_task(server.serve())
+    server_task = asyncio.create_task(server.serve())
 
     while not server.started:
-        if task.done():
-            await task
+        if server_task.done():
+            await server_task
+            return
         await asyncio.sleep(0.1)
 
-    await admin()
-    server.should_exit = True
-    await task
+    print("\nPython server started.")
+    print("Starting Cloudflare Tunnel...")
+
+    start_tunnel()
+
+    try:
+        await admin()
+    finally:
+        server.should_exit = True
+
+        if tunnel_process and tunnel_process.poll() is None:
+            tunnel_process.terminate()
+
+        await server_task
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -132,23 +211,34 @@ if __name__ == "__main__":
 
 (folder / "server.py").write_text(server_code.strip() + "\n")
 
-# Client with automatically inserted credentials
+# Client automatically reads the generated URL file.
 client_code = f'''
 import asyncio
 import json
 import platform
+from pathlib import Path
 import websockets
 
-SERVER_URL = "ws://127.0.0.1:8000/ws"
+BASE = Path(__file__).resolve().parent
+
 CLIENT_ID = {client_id!r}
 CLIENT_TOKEN = {token!r}
+
+def get_server_url():
+    url_file = BASE / "server_url.txt"
+
+    if url_file.exists():
+        return url_file.read_text().strip()
+
+    return "ws://127.0.0.1:8000/ws"
 
 async def main():
     while True:
         try:
-            print("Connecting to server...")
+            url = get_server_url()
+            print("Connecting to:", url)
 
-            async with websockets.connect(SERVER_URL) as ws:
+            async with websockets.connect(url) as ws:
                 await ws.send(json.dumps({{
                     "client_id": CLIENT_ID,
                     "token": CLIENT_TOKEN
@@ -157,7 +247,7 @@ async def main():
                 response = json.loads(await ws.recv())
 
                 if not response.get("ok"):
-                    print("Authentication failed")
+                    print("Authentication failed.")
                     return
 
                 print("Connected and authenticated!")
@@ -191,8 +281,8 @@ if __name__ == "__main__":
     "fastapi\nuvicorn\nwebsockets\n"
 )
 
-print("\nPROJECT REBUILT SUCCESSFULLY")
+print("\nPROJECT REBUILT")
 print("Client ID:", client_id)
-print("New token:", token)
+print("NEW CLIENT TOKEN:", token)
+print("Keep this token private!")
 print("Files created: server.py, client.py, keys.json, requirements.txt")
-print("\nKeep your token private!")
