@@ -4,20 +4,160 @@ import secrets
 import hashlib
 import json
 
-folder = Path(__file__).resolve().parent
+BASE = Path(__file__).resolve().parent
 
-# Generate matching credentials
-client_id = "client1"
-token = secrets.token_urlsafe(32)
-token_hash = hashlib.sha256(token.encode()).hexdigest()
+# Generate fresh credentials
+CLIENT_ID = "client1"
+TOKEN = secrets.token_urlsafe(32)
+TOKEN_HASH = hashlib.sha256(TOKEN.encode()).hexdigest()
 
 # Save authentication database
-(folder / "keys.json").write_text(
-    json.dumps({client_id: token_hash}, indent=4)
+(BASE / "keys.json").write_text(
+    json.dumps({CLIENT_ID: TOKEN_HASH}, indent=4)
 )
 
-# Server with automatic Cloudflare Tunnel
-server_code = r'''
+# ---------------- DASHBOARD ----------------
+
+HTML = r"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fiction Command Center</title>
+<style>
+*{box-sizing:border-box}
+body{
+ margin:0;background:#0b0d14;color:#f4f4f8;
+ font-family:Inter,Segoe UI,Arial,sans-serif;
+ min-height:100vh;padding:35px 18px
+}
+main{max-width:950px;margin:auto}
+header{
+ display:flex;justify-content:space-between;
+ align-items:center;gap:15px;margin-bottom:35px
+}
+h1{font-size:22px;letter-spacing:1px}
+.muted{color:#9295a8}
+.status{
+ color:#4ade80;background:#123322;
+ padding:8px 13px;border-radius:30px;font-size:12px
+}
+.cards{
+ display:grid;grid-template-columns:repeat(2,1fr);
+ gap:16px;margin-bottom:22px
+}
+.card,.panel{
+ background:#151925;border:1px solid #252b3b;
+ border-radius:16px;padding:23px
+}
+.label{color:#9295a8;font-size:12px;letter-spacing:1px}
+.number{font-size:35px;font-weight:700;margin-top:12px}
+.panel h2{font-size:17px;margin:0 0 20px}
+.client{
+ display:flex;justify-content:space-between;
+ align-items:center;padding:17px 0;
+ border-top:1px solid #282e3d
+}
+.client-name{font-weight:600}
+.online{color:#4ade80;font-size:12px}
+.empty{color:#9295a8;padding:20px 0}
+footer{color:#777d90;font-size:12px;margin-top:22px}
+@media(max-width:550px){
+ .cards{grid-template-columns:1fr}
+ header{align-items:flex-start;flex-direction:column}
+}
+</style>
+</head>
+<body>
+<main>
+<header>
+ <div>
+  <h1>FICTION COMMAND CENTER</h1>
+  <div class="muted">Remote connection dashboard</div>
+ </div>
+ <div class="status" id="status">● SERVER ONLINE</div>
+</header>
+
+<section class="cards">
+ <div class="card">
+  <div class="label">CONNECTED CLIENTS</div>
+  <div class="number" id="count">0</div>
+ </div>
+ <div class="card">
+  <div class="label">SERVER STATUS</div>
+  <div class="number" style="color:#4ade80">Healthy</div>
+ </div>
+</section>
+
+<section class="panel">
+ <h2>Connected Clients</h2>
+ <div id="clients">
+  <div class="empty">Loading clients...</div>
+ </div>
+</section>
+
+<footer>
+ Private command server · Public read-only dashboard ·
+ Refreshes every 3 seconds
+</footer>
+</main>
+
+<script>
+async function refresh(){
+ try{
+  const response=await fetch('/api/status',{cache:'no-store'});
+  if(!response.ok)throw new Error('Unavailable');
+
+  const data=await response.json();
+  document.getElementById('count').textContent=data.count;
+
+  const status=document.getElementById('status');
+  status.textContent='● SERVER ONLINE';
+  status.style.color='#4ade80';
+
+  const list=document.getElementById('clients');
+  list.replaceChildren();
+
+  if(data.clients.length===0){
+   const empty=document.createElement('div');
+   empty.className='empty';
+   empty.textContent='No clients connected';
+   list.appendChild(empty);
+  }
+
+  data.clients.forEach(client=>{
+   const row=document.createElement('div');
+   row.className='client';
+
+   const name=document.createElement('span');
+   name.className='client-name';
+   name.textContent=client.id;
+
+   const online=document.createElement('span');
+   online.className='online';
+   online.textContent='● CONNECTED';
+
+   row.append(name,online);
+   list.appendChild(row);
+  });
+ }catch(error){
+  const status=document.getElementById('status');
+  status.textContent='● SERVER UNAVAILABLE';
+  status.style.color='#f87171';
+ }
+}
+
+refresh();
+setInterval(refresh,3000);
+</script>
+</body>
+</html>
+"""
+
+# ---------------- SERVER ----------------
+
+SERVER = r'''
 import asyncio
 import json
 import hashlib
@@ -27,14 +167,15 @@ import re
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 import uvicorn
 
-app = FastAPI()
 BASE = Path(__file__).resolve().parent
 KEYS_FILE = BASE / "keys.json"
 URL_FILE = BASE / "server_url.txt"
 LOG_FILE = BASE / "cloudflared.log"
 
+app = FastAPI()
 clients = {}
 tunnel_url = None
 tunnel_process = None
@@ -44,6 +185,21 @@ def load_keys():
 
 def hash_token(token):
     return hashlib.sha256(token.encode()).hexdigest()
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    return HTMLResponse(HTML)
+
+@app.get("/api/status")
+async def dashboard_status():
+    return {
+        "online": True,
+        "count": len(clients),
+        "clients": [
+            {"id": client_id}
+            for client_id in sorted(clients)
+        ]
+    }
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -62,6 +218,7 @@ async def websocket_endpoint(ws: WebSocket):
 
         clients[client_id] = ws
         await ws.send_json({"ok": True})
+
         print(f"\n[+] {client_id} connected")
 
         while True:
@@ -77,7 +234,7 @@ async def websocket_endpoint(ws: WebSocket):
             print(f"\n[-] {client_id} disconnected")
 
 def start_tunnel():
-    global tunnel_process
+    global tunnel_process, tunnel_url
 
     try:
         tunnel_process = subprocess.Popen(
@@ -115,10 +272,9 @@ def start_tunnel():
 
                         print("\n" + "=" * 45)
                         print("CLOUDFLARE TUNNEL READY")
-                        print("=" * 45)
-                        print("PUBLIC URL:", tunnel_url)
-                        print("CLIENT URL:", ws_url)
-                        print("Saved to server_url.txt")
+                        print("PUBLIC WEBSITE:", tunnel_url)
+                        print("CLIENT ADDRESS:", ws_url)
+                        print("URL saved in server_url.txt")
                         print("=" * 45 + "\n")
 
         threading.Thread(
@@ -127,9 +283,7 @@ def start_tunnel():
         ).start()
 
     except FileNotFoundError:
-        print("\nERROR: cloudflared is not installed.")
-    except Exception as error:
-        print("\nTunnel startup error:", error)
+        print("ERROR: cloudflared is not installed.")
 
 async def admin():
     print("\nCommands:")
@@ -153,7 +307,7 @@ async def admin():
             print(list(clients.keys()))
 
         elif parts[0] == "tunnel":
-            print(tunnel_url or "Tunnel URL not ready yet.")
+            print(tunnel_url or "Tunnel not ready")
 
         elif len(parts) == 3 and parts[0] == "send":
             cid, action = parts[1], parts[2]
@@ -182,11 +336,11 @@ async def main():
     )
 
     server = uvicorn.Server(config)
-    server_task = asyncio.create_task(server.serve())
+    task = asyncio.create_task(server.serve())
 
     while not server.started:
-        if server_task.done():
-            await server_task
+        if task.done():
+            await task
             return
         await asyncio.sleep(0.1)
 
@@ -203,16 +357,15 @@ async def main():
         if tunnel_process and tunnel_process.poll() is None:
             tunnel_process.terminate()
 
-        await server_task
+        await task
 
 if __name__ == "__main__":
     asyncio.run(main())
 '''
 
-(folder / "server.py").write_text(server_code.strip() + "\n")
+# ---------------- CLIENT ----------------
 
-# Client automatically reads the generated URL file.
-client_code = f'''
+CLIENT = f'''
 import asyncio
 import json
 import platform
@@ -221,14 +374,14 @@ import websockets
 
 BASE = Path(__file__).resolve().parent
 
-CLIENT_ID = {client_id!r}
-CLIENT_TOKEN = {token!r}
+CLIENT_ID = {CLIENT_ID!r}
+CLIENT_TOKEN = {TOKEN!r}
 
 def get_server_url():
-    url_file = BASE / "server_url.txt"
+    path = BASE / "server_url.txt"
 
-    if url_file.exists():
-        return url_file.read_text().strip()
+    if path.exists():
+        return path.read_text().strip()
 
     return "ws://127.0.0.1:8000/ws"
 
@@ -247,7 +400,7 @@ async def main():
                 response = json.loads(await ws.recv())
 
                 if not response.get("ok"):
-                    print("Authentication failed.")
+                    print("Authentication failed")
                     return
 
                 print("Connected and authenticated!")
@@ -275,14 +428,27 @@ if __name__ == "__main__":
     asyncio.run(main())
 '''
 
-(folder / "client.py").write_text(client_code.strip() + "\n")
+# ---------------- WRITE PROJECT ----------------
 
-(folder / "requirements.txt").write_text(
+(BASE / "server.py").write_text(
+    "HTML = " + repr(HTML) + "\n\n" + SERVER
+)
+
+(BASE / "client.py").write_text(CLIENT.strip() + "\n")
+
+(BASE / "requirements.txt").write_text(
     "fastapi\nuvicorn\nwebsockets\n"
 )
 
-print("\nPROJECT REBUILT")
-print("Client ID:", client_id)
-print("NEW CLIENT TOKEN:", token)
-print("Keep this token private!")
-print("Files created: server.py, client.py, keys.json, requirements.txt")
+print("\n====================================")
+print("PROJECT REBUILT SUCCESSFULLY")
+print("====================================")
+print("Client ID:", CLIENT_ID)
+print("New client token:", TOKEN)
+print("Created:")
+print("  server.py")
+print("  client.py")
+print("  keys.json")
+print("  requirements.txt")
+print("\nKeep your token private!")
+print("====================================")
