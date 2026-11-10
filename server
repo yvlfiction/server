@@ -13,6 +13,7 @@ import os
 import sys
 import subprocess
 import time
+import urllib.request
 from pathlib import Path
 
 try:
@@ -29,7 +30,11 @@ DATA_DIR.mkdir(exist_ok=True)
 CLIENTS_FILE = DATA_DIR / "clients.json"
 CONFIG_FILE = DATA_DIR / "config.json"
 
-GITHUB_URL_FILE = "https://raw.githubusercontent.com/yvlfiction/server/refs/heads/main/site"
+GITHUB_TOKEN = "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"
+GITHUB_OWNER = "yvlfiction"
+GITHUB_REPO = "server"
+GITHUB_FILE = "site"
+GITHUB_URL_FILE = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/refs/heads/main/{GITHUB_FILE}"
 
 # ─── LOAD / SAVE CONFIG ───────────────────────────────────────────────────────
 def load_config():
@@ -41,6 +46,39 @@ def save_config(cfg):
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
 
 config = load_config()
+
+# ─── GITHUB HELPERS ───────────────────────────────────────────────────────────
+def github_push_url(url):
+    """Push the URL to the GitHub file."""
+    try:
+        # Get current file SHA
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{GITHUB_FILE}",
+            headers={"Authorization": f"token {GITHUB_TOKEN}"}
+        )
+        with urllib.request.urlopen(req) as r:
+            sha = json.loads(r.read())["sha"]
+        # Update
+        req2 = urllib.request.Request(
+            f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{GITHUB_FILE}",
+            data=json.dumps({
+                "message": f"Update URL: {url}",
+                "content": url.encode().hex(),
+                "sha": sha
+            }).encode(),
+            headers={
+                "Authorization": f"token {GITHUB_TOKEN}",
+                "Content-Type": "application/json"
+            },
+            method="PUT"
+        )
+        with urllib.request.urlopen(req2) as r:
+            pass
+        print(f"  ✓ URL pushed to GitHub")
+        return True
+    except Exception as e:
+        print(f"  ⚠ GitHub push failed: {e}")
+        return False
 
 # ─── CLOUDFLARED ──────────────────────────────────────────────────────────────
 def start_cloudflared():
@@ -159,7 +197,7 @@ body{background:#0a0a0a;color:#fff;font-family:'Courier New',monospace;min-heigh
     <input id="url-input" placeholder="your-tunnel.trycloudflare.com">
     <button onclick="saveUrl()">Save to GitHub</button>
     <span class="saved" id="url-saved">✓ saved</span>
-    <span class="github-link">Clients read this from: <a href="__GITHUB_URL_FILE__" target="_blank" style="color:#0f0">github.com/yvlfiction/server/site</a></span>
+    <span class="github-link">Clients read from: <a href="__GITHUB_URL_FILE__" target="_blank" style="color:#0f0">github.com/__GITHUB_OWNER__/__GITHUB_REPO__/__GITHUB_FILE__</a></span>
   </div>
   <div class="section-title">Connected Clients</div>
   <div class="clients" id="clients"><div class="empty">No clients connected</div></div>
@@ -299,6 +337,9 @@ def broadcast():
 
 async def index(request):
     html = DASHBOARD_HTML.replace("__GITHUB_URL_FILE__", GITHUB_URL_FILE)
+    html = html.replace("__GITHUB_OWNER__", GITHUB_OWNER)
+    html = html.replace("__GITHUB_REPO__", GITHUB_REPO)
+    html = html.replace("__GITHUB_FILE__", GITHUB_FILE)
     return web.Response(text=html, content_type="text/html")
 
 async def api_config_get(request):
@@ -310,36 +351,7 @@ async def api_config_post(request):
         url = data["server_url"].strip().replace("https://", "").replace("http://", "")
         config["server_url"] = url
         save_config(config)
-        # Write to GitHub via API
-        try:
-            import urllib.request
-            # Read current file to get sha
-            req = urllib.request.Request(
-                "https://api.github.com/repos/yvlfiction/server/contents/site",
-                headers={"Authorization": f"token {os.environ.get('GITHUB_TOKEN','')}"}
-            )
-            with urllib.request.urlopen(req) as r:
-                sha = json.loads(r.read())["sha"]
-            # Update
-            req2 = urllib.request.Request(
-                "https://api.github.com/repos/yvlfiction/server/contents/site",
-                data=json.dumps({
-                    "message": f"Update URL: {url}",
-                    "content": url.encode().hex(),
-                    "sha": sha
-                }).encode(),
-                headers={
-                    "Authorization": f"token {os.environ.get('GITHUB_TOKEN','')}",
-                    "Content-Type": "application/json"
-                },
-                method="PUT"
-            )
-            with urllib.request.urlopen(req2) as r:
-                pass
-            print(f"\n  [config] URL updated on GitHub: {url}")
-        except Exception as e:
-            print(f"\n  [config] GitHub update failed: {e}")
-            print(f"  [config] URL saved locally: {url}")
+        github_push_url(url)
     return web.json_response({"ok": True, "server_url": config["server_url"]})
 
 async def dashboard_ws_handler(request):
@@ -436,34 +448,7 @@ async def on_startup(app):
     if url:
         config["server_url"] = url
         save_config(config)
-        # Also write to GitHub
-        try:
-            import urllib.request
-            req = urllib.request.Request(
-                "https://api.github.com/repos/yvlfiction/server/contents/site",
-                headers={"Authorization": f"token {os.environ.get('GITHUB_TOKEN','')}"}
-            )
-            with urllib.request.urlopen(req) as r:
-                sha = json.loads(r.read())["sha"]
-            req2 = urllib.request.Request(
-                "https://api.github.com/repos/yvlfiction/server/contents/site",
-                data=json.dumps({
-                    "message": f"Auto-update URL: {url}",
-                    "content": url.encode().hex(),
-                    "sha": sha
-                }).encode(),
-                headers={
-                    "Authorization": f"token {os.environ.get('GITHUB_TOKEN','')}",
-                    "Content-Type": "application/json"
-                },
-                method="PUT"
-            )
-            with urllib.request.urlopen(req2) as r:
-                pass
-            print(f"  ✓ URL pushed to GitHub")
-        except Exception as e:
-            print(f"  ⚠ GitHub push failed: {e}")
-            print(f"  ⚠ Set GITHUB_TOKEN env var to auto-push")
+        github_push_url(url)
         print(f"  ✓ Public URL: https://{url}")
     else:
         print(f"  ⚠ Could not detect tunnel URL.")
